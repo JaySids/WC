@@ -1,1 +1,40 @@
-/* Global styles */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #09090b;
+  color: #e5e5e5;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 2px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* Syntax Highlighting Utilities */
+.token-selector { color: #c084fc; }
+.token-property { color: #34d399; }
+.token-punctuation { color: #9ca3af; }
+.token-string { color: #f472b6; }
+
+.animate-blink {
+  animation: blink 1s step-end infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}

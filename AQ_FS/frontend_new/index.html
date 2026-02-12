@@ -4,71 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>CloneStudio</title>
-    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Playfair+Display:ital,wght@0,400..900;1,400..900&display=swap" rel="stylesheet" />
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
-    <script>
-        tailwind.config = {
-            darkMode: "class",
-            theme: {
-                extend: {
-                    colors: {
-                        "primary": "#ffffff", 
-                        "primary-dim": "#a1a1aa",
-                        "background-light": "#f5f6f8",
-                        "background-dark": "#09090b", 
-                        "panel-dark": "#0c0c0e", 
-                        "border-dark": "#27272a", 
-                        "accent-blue": "#3b82f6",
-                    },
-                    fontFamily: {
-                        "display": ["Inter", "sans-serif"],
-                        "mono": ["JetBrains Mono", "monospace"],
-                        "serif": ["Playfair Display", "serif"],
-                    },
-                },
-            },
-        }
-    </script>
-    <style>
-        body {
-            background-color: #09090b;
-            color: #e5e5e5;
-        }
-        .scrollbar-hide::-webkit-scrollbar {
-            display: none;
-        }
-        .custom-scrollbar::-webkit-scrollbar {
-            width: 4px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-            background: #27272a;
-            border-radius: 2px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-            background: #3f3f46;
-        }
-        /* Syntax Highlighting Utilities */
-        .token-selector { color: #c084fc; } /* purple-400 */
-        .token-property { color: #34d399; } /* emerald-400 */
-        .token-punctuation { color: #9ca3af; } /* gray-400 */
-        .token-string { color: #f472b6; } /* pink-400 */
-        
-        .animate-blink {
-            animation: blink 1s step-end infinite;
-        }
-        @keyframes blink {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0; }
-        }
-    </style>
-<link rel="stylesheet" href="/index.css">
 </head>
 <body class="bg-background-light dark:bg-background-dark text-gray-800 dark:text-gray-300 antialiased selection:bg-white selection:text-black overflow-hidden h-screen w-screen">
     <div id="root" class="h-full w-full"></div>
-<script type="module" src="/index.tsx"></script>
+    <script type="module" src="/index.tsx"></script>
 </body>
 </html>
