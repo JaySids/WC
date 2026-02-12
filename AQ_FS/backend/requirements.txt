@@ -1,4 +1,13 @@
 fastapi
-uvicorn
+uvicorn[standard]
 sqlalchemy
 pydantic
+pydantic-settings
+playwright
+httpx
+python-dotenv
+Pillow
+supabase
+daytona
+anthropic
+google-genai

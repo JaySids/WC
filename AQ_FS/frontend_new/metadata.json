@@ -1,0 +1,5 @@
+{
+  "name": "CloneStudio",
+  "description": "A developer-tool inspired AI chat interface for website cloning and modification, featuring a dual-pane layout with a live preview and a terminal-style command center.",
+  "requestFramePermissions": []
+}
