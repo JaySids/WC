@@ -19,8 +19,6 @@ interface HeaderProps {
   onLogout: () => void;
   url: string;
   setUrl: (url: string) => void;
-  outputFormat: 'html' | 'react';
-  setOutputFormat: (f: 'html' | 'react') => void;
   isCloning: boolean;
   elapsedTime: number;
   onClone: () => void;
@@ -41,7 +39,7 @@ interface HeaderProps {
 
 const Header: React.FC<HeaderProps> = ({
   viewMode, setViewMode, user, onLogout,
-  url, setUrl, outputFormat, setOutputFormat,
+  url, setUrl,
   isCloning, elapsedTime, onClone, onStop, onNewClone, onBack,
   history, showHistory, setShowHistory,
   onHistoryClick, onDeleteClone, onToggleActive, onReactivate,
@@ -93,25 +91,7 @@ const Header: React.FC<HeaderProps> = ({
           />
         </div>
 
-        {/* Format toggle */}
-        <div className="flex border border-white/10 rounded overflow-hidden shrink-0">
-          <button
-            onClick={() => setOutputFormat('html')}
-            className={`px-2 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors ${
-              outputFormat === 'html' ? 'bg-white/10 text-white' : 'text-gray-500 hover:text-white'
-            }`}
-          >
-            HTML
-          </button>
-          <button
-            onClick={() => setOutputFormat('react')}
-            className={`px-2 py-1.5 text-[10px] font-mono uppercase tracking-wider transition-colors ${
-              outputFormat === 'react' ? 'bg-white/10 text-white' : 'text-gray-500 hover:text-white'
-            }`}
-          >
-            React
-          </button>
-        </div>
+        <span className="px-2 py-1.5 text-[10px] font-mono uppercase tracking-wider bg-white/10 text-white rounded shrink-0">React</span>
 
         {/* Clone / Stop */}
         {isCloning ? (
@@ -199,7 +179,7 @@ const Header: React.FC<HeaderProps> = ({
                     history.map(record => {
                       const inactive = record.is_active === false;
                       const hasSaved = record.metadata?.files && Object.keys(record.metadata.files).length > 0;
-                      const fmt = record.output_format || record.metadata?.output_format || 'html';
+                      const fmt = record.output_format || record.metadata?.output_format || 'react';
 
                       return (
                         <div

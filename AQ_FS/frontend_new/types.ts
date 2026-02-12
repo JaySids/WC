@@ -45,7 +45,7 @@ export interface ChatSession {
   cloneId?: string;
   previewUrl?: string;
   url?: string;
-  outputFormat?: 'html' | 'react';
+  outputFormat?: string;
   status?: string;
 }
 

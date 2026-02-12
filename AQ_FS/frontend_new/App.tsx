@@ -3,7 +3,7 @@ import Header from './components/Header';
 import PreviewPane from './components/PreviewPane';
 import TerminalPane from './components/TerminalPane';
 import LandingPage from './components/LandingPage';
-import LoginPage from './components/LoginPage';
+import PasswordGate from './components/PasswordGate';
 import {
   Message, Sender, ChatSession, AgentEvent, FileMap,
   CloneRecord, PipelineStep,
@@ -23,7 +23,9 @@ const App: React.FC = () => {
   // ── Auth ──────────────────────────────────────────────────────────────
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [showLogin, setShowLogin] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(
+    () => sessionStorage.getItem('aq_authenticated') === 'true'
+  );
 
   // ── View ──────────────────────────────────────────────────────────────
   const [showLanding, setShowLanding] = useState(true);
@@ -31,7 +33,7 @@ const App: React.FC = () => {
 
   // ── Clone state ───────────────────────────────────────────────────────
   const [url, setUrl] = useState('');
-  const [outputFormat, setOutputFormat] = useState<'html' | 'react'>('html');
+  const outputFormat = 'react' as const;
   const [isCloning, setIsCloning] = useState(false);
   const [cloneId, setCloneId] = useState('');
   const [previewUrl, setPreviewUrl] = useState('');
@@ -108,6 +110,10 @@ const App: React.FC = () => {
   // ═══════════════════════════════════════════════════════════════════════
   // Fetch history
   // ═══════════════════════════════════════════════════════════════════════
+
+  useEffect(() => {
+    fetchHistory();
+  }, []);
 
   useEffect(() => {
     if (!showLanding) fetchHistory();
@@ -289,13 +295,12 @@ const App: React.FC = () => {
   // Clone Actions
   // ═══════════════════════════════════════════════════════════════════════
 
-  const handleStartClone = async (cloneUrl: string, format?: 'html' | 'react') => {
-    const fmt = format || outputFormat;
+  const handleStartClone = async (cloneUrl: string) => {
+    const fmt = 'react';
     const trimmedUrl = cloneUrl.trim();
     if (!trimmedUrl) return;
 
     setUrl(trimmedUrl);
-    setOutputFormat(fmt);
     setShowLanding(false);
     setIsCloning(true);
     setFiles({});
@@ -425,10 +430,11 @@ const App: React.FC = () => {
     if (record.preview_url) setPreviewUrl(record.preview_url);
     setCloneId(record.id);
     setUrl(record.url || '');
-    setOutputFormat((record.output_format as 'html' | 'react') || 'html');
+    // output format is always react
     setFiles({});
     setActiveFile('');
     setShowHistory(false);
+    setShowLanding(false);
 
     // Create session for this history item
     const existing = sessions.find(s => s.cloneId === record.id);
@@ -444,7 +450,7 @@ const App: React.FC = () => {
         cloneId: record.id,
         previewUrl: record.preview_url,
         url: record.url,
-        outputFormat: (record.output_format as 'html' | 'react') || 'html',
+        outputFormat: 'react',
         messages: [{
           id: sid + '-load',
           timestamp: ts(),
@@ -520,9 +526,7 @@ const App: React.FC = () => {
         );
         if (res.ok) {
           const data = await res.json();
-          if (data.output_format === 'html' && iframeRef.current) {
-            iframeRef.current.src = iframeRef.current.src;
-          }
+          // React hot-reloads automatically
         }
       } catch { /* silent */ }
     }, 500);
@@ -555,7 +559,7 @@ const App: React.FC = () => {
       if (session.cloneId) setCloneId(session.cloneId);
       if (session.previewUrl) setPreviewUrl(session.previewUrl);
       if (session.url) setUrl(session.url);
-      if (session.outputFormat) setOutputFormat(session.outputFormat);
+      // outputFormat is always react
     }
   };
 
@@ -585,6 +589,10 @@ const App: React.FC = () => {
   // Render
   // ═══════════════════════════════════════════════════════════════════════
 
+  if (!isAuthenticated) {
+    return <PasswordGate onAuthenticated={() => setIsAuthenticated(true)} />;
+  }
+
   if (authLoading) {
     return (
       <div className="min-h-screen bg-[#050505] flex items-center justify-center">
@@ -593,22 +601,22 @@ const App: React.FC = () => {
     );
   }
 
-  if (showLogin) {
-    return <LoginPage onBack={() => setShowLogin(false)} onSuccess={() => setShowLogin(false)} />;
-  }
-
   if (showLanding) {
     return (
       <LandingPage
-        onStart={(cloneUrl: string, format?: 'html' | 'react') => {
+        onStart={(cloneUrl: string) => {
           if (cloneUrl) {
-            handleStartClone(cloneUrl, format);
+            handleStartClone(cloneUrl);
           } else {
             setShowLanding(false);
           }
         }}
-        onLogin={() => setShowLogin(true)}
-        user={user}
+        history={history}
+        onHistoryClick={handleHistoryClick}
+        onDeleteClone={handleDeleteClone}
+        onToggleActive={handleToggleActive}
+        onReactivate={handleReactivate}
+        reactivatingId={reactivatingId}
       />
     );
   }
@@ -622,8 +630,6 @@ const App: React.FC = () => {
         onLogout={handleLogout}
         url={url}
         setUrl={setUrl}
-        outputFormat={outputFormat}
-        setOutputFormat={setOutputFormat}
         isCloning={isCloning}
         elapsedTime={elapsedTime}
         onClone={() => handleStartClone(url)}
