@@ -250,21 +250,20 @@ async def rebuild_clone_endpoint(clone_id: str):
         sandbox_result = await create_react_boilerplate_sandbox()
         project_root = sandbox_result.get("project_root", "/home/daytona/my-app")
 
-        # Upload saved files
         from app.sandbox_template import upload_files_to_sandbox
-        from app.agent import _touch_sandbox_files, active_sandboxes, _chat_sessions
+        from app.sandbox import get_daytona_client, BUN_BIN
+        from app.agent import _restart_dev_server, active_sandboxes, _chat_sessions
         import time
 
         # Remove conflicting .tsx files (scaffolded defaults) if we have .jsx versions
         tsx_to_remove = [fp.replace(".jsx", ".tsx") for fp in saved_files if fp.endswith(".jsx")]
         if tsx_to_remove:
-            from app.sandbox import get_daytona_client
             def _remove_tsx():
                 try:
                     daytona = get_daytona_client()
                     sb = daytona.get(sandbox_result["sandbox_id"])
-                    for tsx_path in tsx_to_remove:
-                        sb.process.exec(f"rm -f {project_root}/{tsx_path}", timeout=5)
+                    paths = " ".join(f"{project_root}/{p}" for p in tsx_to_remove)
+                    sb.process.exec(f"rm -f {paths}", timeout=10)
                 except Exception:
                     pass
             await asyncio.to_thread(_remove_tsx)
@@ -274,11 +273,14 @@ async def rebuild_clone_endpoint(clone_id: str):
             saved_files,
             project_root=project_root,
         )
-        await _touch_sandbox_files(
-            sandbox_result["sandbox_id"],
-            list(saved_files.keys()),
-            project_root,
-        )
+
+        # Restart the dev server after the tsx→jsx swap — without this the
+        # running Next.js process crashes on the file type change and never
+        # picks up the new files.
+        await _restart_dev_server(sandbox_result["sandbox_id"], project_root)
+
+        # Wait for recompilation with the new files
+        await asyncio.sleep(8)
 
         await update_clone(clone_id, {
             "sandbox_id": sandbox_result["sandbox_id"],

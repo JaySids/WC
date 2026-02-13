@@ -9,6 +9,7 @@ A background monitor updates Supabase when sandboxes go down.
 import asyncio
 import queue
 import time
+import threading
 
 from daytona import Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams
 
@@ -17,6 +18,9 @@ from app.config import get_settings
 
 # Sandbox auto-stop after N minutes of inactivity (Daytona-managed)
 SANDBOX_TTL_MINUTES = 30
+
+# Serialize all Daytona create/delete operations to prevent concurrent API abuse
+_daytona_lock = threading.Lock()
 
 
 def _get_api_key():
@@ -163,141 +167,142 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                     raise
 
     def _create():
-        daytona = get_daytona_client()
+        with _daytona_lock:
+            daytona = get_daytona_client()
+            sandbox = None
 
-        _notify("Provisioning cloud sandbox...")
-        params = CreateSandboxFromSnapshotParams(
-            language="typescript",
-            public=True,
-            auto_stop_interval=SANDBOX_TTL_MINUTES,
-            auto_archive_interval=7 * 24 * 60,  # 7 days in minutes
-        )
-        sandbox = daytona.create(params, timeout=120)
-
-        # Wait for sandbox to be fully ready before executing commands.
-        # daytona.create() returns once the sandbox object exists, but the
-        # underlying container may still be starting up.  Without this
-        # readiness gate the very first process.exec() can fail with
-        # connection-refused / "not running" errors — which is why
-        # "reactivating" (daytona.start) works but fresh creates crash.
-        _notify("Waiting for sandbox to be ready...")
-        for _ready_attempt in range(30):          # up to ~60s
             try:
-                probe = sandbox.process.exec("echo ready", timeout=10)
-                if probe.result and "ready" in probe.result:
-                    _notify(f"Sandbox responsive after {(_ready_attempt + 1) * 2}s")
-                    break
-            except Exception as probe_err:
-                if _ready_attempt % 5 == 4:  # log every 10s
-                    _notify(f"  Still waiting for sandbox... ({(_ready_attempt + 1) * 2}s, last error: {probe_err})")
-            time.sleep(2)
-        else:
-            _notify("WARNING: Sandbox not responsive after 60s — proceeding anyway")
+                _notify("Provisioning cloud sandbox...")
+                params = CreateSandboxFromSnapshotParams(
+                    language="typescript",
+                    public=True,
+                    auto_stop_interval=SANDBOX_TTL_MINUTES,
+                    auto_archive_interval=7 * 24 * 60,  # 7 days in minutes
+                )
+                sandbox = daytona.create(params, timeout=120)
 
-        try:
-            sandbox.set_autostop_interval(SANDBOX_TTL_MINUTES)
-            sandbox.set_auto_archive_interval(7 * 24 * 60)
-        except Exception:
-            pass
+                # Wait for sandbox to be fully ready before executing commands.
+                _notify("Waiting for sandbox to be ready...")
+                for _ready_attempt in range(30):          # up to ~60s
+                    try:
+                        probe = sandbox.process.exec("echo ready", timeout=10)
+                        if probe.result and "ready" in probe.result:
+                            _notify(f"Sandbox responsive after {(_ready_attempt + 1) * 2}s")
+                            break
+                    except Exception as probe_err:
+                        if _ready_attempt % 5 == 4:  # log every 10s
+                            _notify(f"  Still waiting for sandbox... ({(_ready_attempt + 1) * 2}s, last error: {probe_err})")
+                    time.sleep(2)
+                else:
+                    _notify("WARNING: Sandbox not responsive after 60s — proceeding anyway")
 
-        # Install bun & kill stale processes
-        _notify("Installing bun runtime...")
-        _exec(sandbox, "curl -fsSL https://bun.sh/install | bash", timeout=60)
-        sandbox.process.exec("pkill -f next || true; pkill -f bun || true")
+                try:
+                    sandbox.set_autostop_interval(SANDBOX_TTL_MINUTES)
+                    sandbox.set_auto_archive_interval(7 * 24 * 60)
+                except Exception:
+                    pass
 
-        # Scaffold Next.js project (latest — TypeScript + Tailwind + App Router)
-        _notify("Scaffolding Next.js project...")
-        _exec(
-            sandbox,
-            f"{BUN_BIN} create next-app@latest {PROJECT_PATH} "
-            f"--typescript --tailwind --eslint --app --use-bun --yes",
-            timeout=90,
-        )
+                # Install bun & kill stale processes
+                _notify("Installing bun runtime...")
+                _exec(sandbox, "curl -fsSL https://bun.sh/install | bash", timeout=60)
+                sandbox.process.exec("pkill -f next || true; pkill -f bun || true")
 
-        # Install extra packages in one shot (skip separate bun install — scaffold already did it)
-        _notify("Installing extra packages...")
-        _exec(
-            sandbox,
-            f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
-            timeout=90,
-        )
+                # Scaffold Next.js project (latest — TypeScript + Tailwind + App Router)
+                _notify("Scaffolding Next.js project...")
+                _exec(
+                    sandbox,
+                    f"{BUN_BIN} create next-app@latest {PROJECT_PATH} "
+                    f"--typescript --tailwind --eslint --app --use-bun --yes",
+                    timeout=90,
+                )
 
-        # Upload ErrorBoundary component
-        sandbox.process.exec(f"mkdir -p {PROJECT_PATH}/components", timeout=5)
-        sandbox.fs.upload_file(
-            ERROR_BOUNDARY_TSX.strip().encode("utf-8"),
-            f"{PROJECT_PATH}/components/ErrorBoundary.tsx",
-        )
+                # Install extra packages in one shot
+                _notify("Installing extra packages...")
+                _exec(
+                    sandbox,
+                    f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
+                    timeout=90,
+                )
 
-        # Replace default layout.tsx to avoid Turbopack font resolution error
-        # (create-next-app scaffolds Geist font via next/font/google which breaks
-        # under bun's runtime — the agent overwrites layout.tsx during generation anyway)
-        _minimal_layout = (
-            'import "./globals.css";\n'
-            'export const metadata = { title: "Clone", description: "Website clone" };\n'
-            'export default function RootLayout({ children }: { children: React.ReactNode }) {\n'
-            '  return <html lang="en"><body>{children}</body></html>;\n'
-            '}\n'
-        )
-        sandbox.fs.upload_file(
-            _minimal_layout.encode("utf-8"),
-            f"{PROJECT_PATH}/app/layout.tsx",
-        )
+                # Upload ErrorBoundary component
+                sandbox.process.exec(f"mkdir -p {PROJECT_PATH}/components", timeout=5)
+                sandbox.fs.upload_file(
+                    ERROR_BOUNDARY_TSX.strip().encode("utf-8"),
+                    f"{PROJECT_PATH}/components/ErrorBoundary.tsx",
+                )
 
-        # Start dev server
-        _notify("Starting Next.js dev server...")
-        log_file = f"{PROJECT_PATH}/server.log"
-        start_cmd = (
-            f"nohup {BUN_BIN} --cwd {PROJECT_PATH} --bun next dev -p 3000 -H 0.0.0.0 "
-            f"> {log_file} 2>&1 &"
-        )
-        sandbox.process.exec(start_cmd)
+                # Replace default layout.tsx to avoid Turbopack font resolution error
+                _minimal_layout = (
+                    'import "./globals.css";\n'
+                    'export const metadata = { title: "Clone", description: "Website clone" };\n'
+                    'export default function RootLayout({ children }: { children: React.ReactNode }) {\n'
+                    '  return <html lang="en"><body>{children}</body></html>;\n'
+                    '}\n'
+                )
+                sandbox.fs.upload_file(
+                    _minimal_layout.encode("utf-8"),
+                    f"{PROJECT_PATH}/app/layout.tsx",
+                )
 
-        # Wait for dev server (30 attempts x 2s = 60s max)
-        _notify("Waiting for compilation...")
-        ready = False
-        for _wait in range(30):
-            time.sleep(2)
-            try:
-                logs = sandbox.process.exec(f"tail -20 {log_file} 2>/dev/null", timeout=10)
-                log_text = (logs.result or "").lower()
-                if "ready" in log_text or "compiled" in log_text or "✓ ready" in log_text:
-                    ready = True
-                    _notify(f"Next.js compiled successfully ({(_wait + 1) * 2}s)")
-                    break
-                if "error" in log_text and "failed to compile" in log_text:
-                    _notify("Next.js has errors but server is running")
-                    ready = True
-                    break
-            except Exception:
-                pass
-        if not ready:
-            _notify("Timeout waiting for Next.js after 60s — proceeding anyway")
+                # DON'T start the dev server yet for rebuilds — caller will upload
+                # saved files first and then start. For fresh clones the agent pipeline
+                # handles the restart after file upload.  We still start it here so
+                # fresh clones see the default page while generating.
+                _notify("Starting Next.js dev server...")
+                log_file = f"{PROJECT_PATH}/server.log"
+                start_cmd = (
+                    f"nohup {BUN_BIN} --cwd {PROJECT_PATH} --bun next dev -p 3000 -H 0.0.0.0 "
+                    f"> {log_file} 2>&1 &"
+                )
+                sandbox.process.exec(start_cmd)
 
-        # Signed URL embeds directly in iframes without Daytona's preview page
-        preview_url = _get_iframe_preview_url(sandbox, 3000)
-        _notify(f"Sandbox ID: {sandbox.id} — Preview URL: {preview_url}")
+                # Wait for dev server (30 attempts x 2s = 60s max)
+                _notify("Waiting for compilation...")
+                ready = False
+                for _wait in range(30):
+                    time.sleep(2)
+                    try:
+                        logs = sandbox.process.exec(f"tail -20 {log_file} 2>/dev/null", timeout=10)
+                        log_text = (logs.result or "").lower()
+                        if "ready" in log_text or "compiled" in log_text or "✓ ready" in log_text:
+                            ready = True
+                            _notify(f"Next.js compiled successfully ({(_wait + 1) * 2}s)")
+                            break
+                        if "error" in log_text and "failed to compile" in log_text:
+                            _notify("Next.js has errors but server is running")
+                            ready = True
+                            break
+                    except Exception:
+                        pass
+                if not ready:
+                    _notify("Timeout waiting for Next.js after 60s — proceeding anyway")
 
-        # Read key project files
-        initial_files = _read_sandbox_files(sandbox, PROJECT_PATH)
-        _notify(f"Sandbox ready — {len(initial_files)} files loaded")
+                # Signed URL embeds directly in iframes without Daytona's preview page
+                preview_url = _get_iframe_preview_url(sandbox, 3000)
+                _notify(f"Sandbox ID: {sandbox.id} — Preview URL: {preview_url}")
 
-        return {
-            "preview_url": preview_url,
-            "sandbox_id": sandbox.id,
-            "project_root": PROJECT_PATH,
-            "initial_files": initial_files,
-        }
+                # Read key project files
+                initial_files = _read_sandbox_files(sandbox, PROJECT_PATH)
+                _notify(f"Sandbox ready — {len(initial_files)} files loaded")
 
-    # Retry entire sandbox creation once on failure
-    try:
-        return await asyncio.to_thread(_create)
-    except Exception as first_err:
-        _notify(f"Sandbox creation failed ({first_err}), retrying...")
-        try:
-            return await asyncio.to_thread(_create)
-        except Exception:
-            raise first_err  # Raise original error
+                return {
+                    "preview_url": preview_url,
+                    "sandbox_id": sandbox.id,
+                    "project_root": PROJECT_PATH,
+                    "initial_files": initial_files,
+                }
+
+            except Exception as e:
+                # Clean up the orphaned sandbox so it doesn't leak
+                if sandbox:
+                    try:
+                        _notify(f"Cleaning up failed sandbox {sandbox.id[:12]}...")
+                        daytona.delete(sandbox)
+                    except Exception:
+                        pass
+                raise
+
+    return await asyncio.to_thread(_create)
 
 
 async def stop_sandbox(sandbox_id: str, delete: bool = False):
@@ -307,17 +312,18 @@ async def stop_sandbox(sandbox_id: str, delete: bool = False):
         return
 
     def _stop():
-        try:
-            daytona = get_daytona_client()
-            sandbox = daytona.get(sandbox_id)
-            if delete:
-                daytona.delete(sandbox)
-                print(f"Sandbox {sandbox_id} deleted")
-            else:
-                daytona.stop(sandbox)
-                print(f"Sandbox {sandbox_id} stopped")
-        except Exception as e:
-            print(f"Error with sandbox {sandbox_id}: {e}")
+        with _daytona_lock:
+            try:
+                daytona = get_daytona_client()
+                sandbox = daytona.get(sandbox_id)
+                if delete:
+                    daytona.delete(sandbox)
+                    print(f"Sandbox {sandbox_id} deleted")
+                else:
+                    daytona.stop(sandbox)
+                    print(f"Sandbox {sandbox_id} stopped")
+            except Exception as e:
+                print(f"Error with sandbox {sandbox_id}: {e}")
 
     await asyncio.to_thread(_stop)
 

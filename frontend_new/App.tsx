@@ -687,7 +687,11 @@ const App: React.FC = () => {
 
     setReactivatingId(record.id);
     try {
-      const res = await fetch(`${API_URL}/clone/${record.id}/rebuild`, { method: 'POST' });
+      const controller = new AbortController();
+      const res = await fetch(`${API_URL}/clone/${record.id}/rebuild`, {
+        method: 'POST',
+        signal: controller.signal,
+      });
       if (res.ok) {
         const data = await res.json();
         setHistory(prev => prev.map(h =>
@@ -697,6 +701,7 @@ const App: React.FC = () => {
         setCloneId(record.id);
         setUrl(record.url || '');
         setShowHistory(false);
+        setShowLanding(false);
       }
     } catch { /* silent */ }
     finally { setReactivatingId(null); }
