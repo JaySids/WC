@@ -276,11 +276,9 @@ async def rebuild_clone_endpoint(clone_id: str):
 
         # Restart the dev server after the tsx→jsx swap — without this the
         # running Next.js process crashes on the file type change and never
-        # picks up the new files.
+        # picks up the new files.  _restart_dev_server now includes an HTTP
+        # health check, so no extra sleep is needed.
         await _restart_dev_server(sandbox_result["sandbox_id"], project_root)
-
-        # Wait for recompilation with the new files
-        await asyncio.sleep(8)
 
         await update_clone(clone_id, {
             "sandbox_id": sandbox_result["sandbox_id"],
@@ -526,27 +524,22 @@ async def cleanup_all_sandboxes():
     Delete ALL active Daytona sandboxes on startup.
     Preserves all Supabase data (files, metadata, history) — only removes
     the live sandbox references so clones can still be reactivated later.
+
+    Runs actual Daytona deletions in a background task so the endpoint
+    returns immediately and does NOT hold _daytona_lock while the user
+    starts a new clone.
     """
     from app.agent import active_sandboxes, _chat_sessions
     from app.database import _get_client as get_db
 
-    deleted = []
-    errors = []
+    # Collect sandbox IDs to delete BEFORE clearing in-memory state
+    sandbox_ids_to_delete: set[str] = set(active_sandboxes.keys())
 
-    # 1. Delete all in-memory tracked sandboxes
-    sandbox_ids_done = set()
-    for sid in list(active_sandboxes.keys()):
-        try:
-            from app.sandbox import stop_sandbox
-            await stop_sandbox(sid, delete=True)
-            deleted.append(sid)
-        except Exception as e:
-            errors.append(f"{sid[:12]}: {e}")
-        sandbox_ids_done.add(sid)
+    # Immediately clear in-memory state so new clones don't collide
     active_sandboxes.clear()
     _chat_sessions.clear()
 
-    # 2. Find any active clones in DB that still have a sandbox_id and delete those too
+    # Also grab sandbox IDs from DB
     try:
         db = get_db()
         result = (
@@ -557,24 +550,34 @@ async def cleanup_all_sandboxes():
         )
         for row in (result.data or []):
             sid = row.get("sandbox_id")
-            if sid and sid not in sandbox_ids_done:
-                try:
-                    from app.sandbox import stop_sandbox
-                    await stop_sandbox(sid, delete=True)
-                    deleted.append(sid)
-                except Exception as e:
-                    errors.append(f"{sid[:12]}: {e}")
+            if sid:
+                sandbox_ids_to_delete.add(sid)
 
-        # Clear sandbox references and mark inactive — files/metadata stay intact
+        # Immediately clear sandbox references in DB — files/metadata stay intact
         db.table("clones").update({
             "is_active": False,
             "sandbox_id": None,
         }).not_.is_("sandbox_id", "null").execute()
     except Exception as e:
-        errors.append(f"DB cleanup: {e}")
+        print(f"[cleanup] DB error: {e}")
 
-    print(f"[cleanup] Deleted {len(deleted)} sandbox(es), {len(errors)} error(s)")
-    return {"status": "cleaned", "deleted": len(deleted), "errors": errors}
+    # Fire-and-forget: delete Daytona sandboxes in background so we don't
+    # hold _daytona_lock and block new sandbox creation.
+    async def _bg_delete():
+        deleted = 0
+        for sid in sandbox_ids_to_delete:
+            try:
+                from app.sandbox import stop_sandbox
+                await stop_sandbox(sid, delete=True)
+                deleted += 1
+            except Exception as e:
+                print(f"[cleanup-bg] Failed to delete {sid[:12]}: {e}")
+        print(f"[cleanup-bg] Deleted {deleted}/{len(sandbox_ids_to_delete)} sandbox(es)")
+
+    asyncio.create_task(_bg_delete())
+
+    print(f"[cleanup] Queued {len(sandbox_ids_to_delete)} sandbox(es) for background deletion")
+    return {"status": "cleaned", "queued": len(sandbox_ids_to_delete)}
 
 
 @app.get("/clone/{clone_id}/export")

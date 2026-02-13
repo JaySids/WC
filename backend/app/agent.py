@@ -102,7 +102,7 @@ async def _touch_sandbox_files(sandbox_id: str, filepaths: list[str], project_ro
 
 
 async def _restart_dev_server(sandbox_id: str, project_root: str):
-    """Kill any running Next.js/bun processes and restart the dev server."""
+    """Kill any running Next.js/bun processes, restart, and verify HTTP health."""
     def _restart():
         try:
             daytona = get_daytona_client()
@@ -128,6 +128,23 @@ async def _restart_dev_server(sandbox_id: str, project_root: str):
                 # Try one more time
                 sb.process.exec(start_cmd, timeout=15)
                 _t.sleep(2)
+
+            # HTTP health check — wait until the server actually responds
+            print("  [restart-dev] Waiting for HTTP readiness...")
+            for attempt in range(20):  # up to 40s
+                try:
+                    curl = sb.process.exec(
+                        "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null",
+                        timeout=10,
+                    )
+                    code = (curl.result or "").strip()
+                    if code in ("200", "304"):
+                        print(f"  [restart-dev] HTTP OK (status {code}) after {(attempt + 1) * 2}s")
+                        return
+                except Exception:
+                    pass
+                _t.sleep(2)
+            print("  [restart-dev] WARNING: HTTP health check failed after 40s")
         except Exception as e:
             print(f"  [restart-dev] Failed: {e}")
     await asyncio.to_thread(_restart)

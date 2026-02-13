@@ -256,7 +256,9 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                 )
                 sandbox.process.exec(start_cmd)
 
-                # Wait for dev server (30 attempts x 2s = 60s max)
+                # Wait for dev server — two-phase check:
+                # Phase 1: Log-based (fast — detects compilation)
+                # Phase 2: HTTP-based (reliable — confirms server actually serves)
                 _notify("Waiting for compilation...")
                 ready = False
                 for _wait in range(30):
@@ -275,7 +277,27 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                     except Exception:
                         pass
                 if not ready:
-                    _notify("Timeout waiting for Next.js after 60s — proceeding anyway")
+                    _notify("Timeout waiting for Next.js logs after 60s — proceeding anyway")
+
+                # Phase 2: HTTP health check — verify the page actually serves
+                _notify("Verifying HTTP readiness...")
+                http_ok = False
+                for _http_wait in range(15):  # up to 30s
+                    try:
+                        curl = sandbox.process.exec(
+                            "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null",
+                            timeout=10,
+                        )
+                        code = (curl.result or "").strip()
+                        if code in ("200", "304"):
+                            http_ok = True
+                            _notify(f"HTTP OK (status {code}) after {(_http_wait + 1) * 2}s")
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                if not http_ok:
+                    _notify("WARNING: HTTP health check failed after 30s — server may not be serving")
 
                 # Signed URL embeds directly in iframes without Daytona's preview page
                 preview_url = _get_iframe_preview_url(sandbox, 3000)
@@ -356,13 +378,32 @@ async def start_sandbox(sandbox_id: str) -> dict:
 
         # Restart dev server
         sandbox.process.exec("pkill -f next || true; pkill -f bun || true")
+        time.sleep(2)
         log_file = f"{PROJECT_PATH}/server.log"
+        sandbox.process.exec(f"> {log_file}", timeout=10)
         start_cmd = (
             f"nohup {BUN_BIN} --cwd {PROJECT_PATH} --bun next dev -p 3000 -H 0.0.0.0 "
             f"> {log_file} 2>&1 &"
         )
         sandbox.process.exec(start_cmd)
-        time.sleep(5)
+
+        # HTTP health check — wait until server actually responds
+        print(f"[start_sandbox] Waiting for HTTP readiness on {sandbox_id[:12]}...")
+        for attempt in range(20):  # up to 40s
+            time.sleep(2)
+            try:
+                curl = sandbox.process.exec(
+                    "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ 2>/dev/null",
+                    timeout=10,
+                )
+                code = (curl.result or "").strip()
+                if code in ("200", "304"):
+                    print(f"[start_sandbox] HTTP OK (status {code}) after {(attempt + 1) * 2}s")
+                    break
+            except Exception:
+                pass
+        else:
+            print(f"[start_sandbox] WARNING: HTTP health check failed after 40s")
 
         # Signed URL embeds directly in iframes without Daytona's preview page
         preview_url = _get_iframe_preview_url(sandbox, 3000)
