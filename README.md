@@ -20,9 +20,6 @@ Paste URL  -->  AI scrapes the site  -->  Generates React clone  -->  Deploys to
 2. **Generate** -- Claude Sonnet 4 analyzes the screenshots + structured data and produces a complete Next.js app (layout, page, components, CSS) in a single pass
 3. **Deploy** -- Files are uploaded to a Daytona cloud sandbox with a pre-configured Next.js environment. Hot-reloads instantly
 4. **Verify & Fix** -- The agent checks compilation, fetches the page, and if there are errors, an AI diagnosis loop auto-fixes them (up to 4 iterations)
-5. **Chat** -- After the initial clone, ask the agent to tweak anything ("make the header darker", "add a CTA button") and it updates the live sandbox in real-time
-
-Everything streams to the frontend via Server-Sent Events so you see each step as it happens.
 
 ---
 
