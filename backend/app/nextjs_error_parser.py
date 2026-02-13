@@ -41,7 +41,7 @@ def parse_nextjs_errors(log_output: str) -> dict:
     last_block = compile_blocks[-1] if compile_blocks else log_output
 
     # Check if the LATEST compilation succeeded
-    if re.search(r"Compiled\s+(?:successfully|.*?in\s+\d)|Ready\s+in\s+\d|✓\s*(?:Ready|Compiled)", last_block, re.IGNORECASE):
+    if re.search(r"Compiled\s+(successfully|in\s+\d)", last_block, re.IGNORECASE):
         compiled = True
 
     # "Failed to compile" in latest block

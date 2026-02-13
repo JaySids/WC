@@ -138,42 +138,6 @@ async def _restart_dev_server(sandbox_id: str, project_root: str):
     await asyncio.to_thread(_restart)
 
 
-async def _start_dev_server_fresh(sandbox_id: str, project_root: str):
-    """Start the dev server from scratch (no restart — used after initial file upload).
-
-    Kills any stale processes, clears the log file, and starts `next dev`.
-    Does NOT wait for compilation — the caller handles polling.
-    """
-    def _start():
-        try:
-            daytona = get_daytona_client()
-            sb = daytona.get(sandbox_id)
-            # Kill any stale processes (safety)
-            sb.process.exec("pkill -f next || true; pkill -f bun || true", timeout=15)
-            import time as _t
-            _t.sleep(2)
-            # Clear/create log file
-            log_file = f"{project_root}/server.log"
-            sb.process.exec(f"> {log_file}", timeout=10)
-            # Start dev server
-            start_cmd = (
-                f"nohup {BUN_BIN} --cwd {project_root} --bun next dev -p 3000 -H 0.0.0.0 "
-                f"> {log_file} 2>&1 &"
-            )
-            sb.process.exec(start_cmd, timeout=15)
-            # Brief pause to let process spawn
-            _t.sleep(2)
-            # Verify process is running
-            check = sb.process.exec("pgrep -f 'next dev' || echo 'NOT_RUNNING'", timeout=10)
-            if check.result and "NOT_RUNNING" in check.result:
-                print("  [start-dev] WARNING: dev server not found after start — retrying")
-                sb.process.exec(start_cmd, timeout=15)
-                _t.sleep(2)
-        except Exception as e:
-            print(f"  [start-dev] Failed: {e}")
-    await asyncio.to_thread(_start)
-
-
 async def _check_sandbox_http(sandbox_id: str, wait_before: float = 3.0) -> dict:
     """Fetch the page from the sandbox and check for errors.
 
@@ -1028,41 +992,30 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         yield sse_event("done", {"preview_url": state.get("preview_url"), "error": str(upload_err)})
         return
 
-    # Start dev server fresh — no server was running during sandbox provisioning
-    _log("Starting Next.js dev server...")
-    yield sse_event("step", {"step": "checking", "message": "Starting dev server..."})
-    await _start_dev_server_fresh(sandbox_info["sandbox_id"], state["project_root"])
+    # Restart the dev server — tsx removal + file replacement can crash it
+    _log("Restarting Next.js dev server...")
+    await _restart_dev_server(sandbox_info["sandbox_id"], state["project_root"])
 
     # ============================================================
     # [E] CHECK COMPILATION + FIX
     # ============================================================
-    _log("Polling for compilation (up to 30s, with HTTP fallback)...")
+    _log("Polling for compilation (up to 60s)...")
     yield sse_event("step", {"step": "checking", "message": "Waiting for compilation..."})
-    for _poll in range(15):  # 15 x 2s = 30s max
-        await asyncio.sleep(2)
+    for _poll in range(20):  # up to 60s
+        await asyncio.sleep(3)
         try:
             poll_logs = await get_sandbox_logs(
                 sandbox_info["sandbox_id"], state["project_root"], lines=100,
             )
             poll_parsed = parse_nextjs_errors(poll_logs)
             if poll_parsed["compiled"] or poll_parsed["has_errors"]:
-                _log(f"Compilation detected after {(_poll + 1) * 2}s "
+                _log(f"Compilation detected after {(_poll + 1) * 3}s "
                      f"(compiled={poll_parsed['compiled']}, errors={poll_parsed['has_errors']})")
                 break
         except Exception:
             pass  # sandbox not ready yet, keep polling
-
-        # Every 3rd iteration (~6s), also try HTTP as a faster signal
-        if (_poll + 1) % 3 == 0:
-            try:
-                http_probe = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0)
-                if http_probe["status_code"] == 200 and http_probe["body_length"] > 500:
-                    _log(f"HTTP check OK after {(_poll + 1) * 2}s — server is up")
-                    break
-            except Exception:
-                pass
     else:
-        _log("Compilation not detected after 30s — proceeding to check anyway")
+        _log("Compilation not detected after 60s — proceeding to check anyway")
 
     all_errors_seen = []   # Cumulative error tracking
     prior_fixes = {}       # Track files modified in previous attempts
@@ -1143,28 +1096,19 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         # If nothing detected yet (not compiled or inconclusive)
         if not has_errors and not http_runtime_errors:
             if attempt < max_fix_attempts - 1:
-                _log("Not compiled yet, polling up to 10s (with HTTP)...")
-                for _wpoll in range(5):  # 5 x 2s = 10s
-                    await asyncio.sleep(2)
+                _log("Not compiled yet, polling up to 15s...")
+                for _wpoll in range(5):  # up to 15s
+                    await asyncio.sleep(3)
                     try:
                         wpoll_logs = await get_sandbox_logs(
                             sandbox_info["sandbox_id"], state["project_root"], lines=100,
                         )
                         wpoll_parsed = parse_nextjs_errors(wpoll_logs)
                         if wpoll_parsed["compiled"] or wpoll_parsed["has_errors"]:
-                            _log(f"Compilation detected after {(_wpoll + 1) * 2}s")
+                            _log(f"Compilation detected after {(_wpoll + 1) * 3}s")
                             break
                     except Exception:
                         pass
-                    # Also try HTTP on every other iteration
-                    if (_wpoll + 1) % 2 == 0:
-                        try:
-                            http_probe = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0)
-                            if http_probe["status_code"] == 200 and http_probe["body_length"] > 500:
-                                _log(f"HTTP OK after {(_wpoll + 1) * 2}s inner poll")
-                                break
-                        except Exception:
-                            pass
                 continue
             else:
                 _log("Logs inconclusive — trying HTTP check...")
@@ -1375,29 +1319,21 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
                 yield sse_event("step", {"step": "verifying", "message": f"Verifying fix (attempt {fix_iterations})..."})
                 _log(f"Fixed {len(fixed)} files, polling for recompilation...")
-                for _rpoll in range(10):  # 10 x 2s = 20s max
-                    await asyncio.sleep(2)
+                # Smart polling instead of blind sleep
+                for _rpoll in range(15):  # up to 45s
+                    await asyncio.sleep(3)
                     try:
                         rpoll_logs = await get_sandbox_logs(
                             sandbox_info["sandbox_id"], state["project_root"], lines=100,
                         )
                         rpoll_parsed = parse_nextjs_errors(rpoll_logs)
                         if rpoll_parsed["compiled"] or rpoll_parsed["has_errors"]:
-                            _log(f"Recompilation detected after {(_rpoll + 1) * 2}s")
+                            _log(f"Recompilation detected after {(_rpoll + 1) * 3}s")
                             break
                     except Exception:
                         pass
-                    # HTTP check every 3rd iteration
-                    if (_rpoll + 1) % 3 == 0:
-                        try:
-                            http_probe = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0)
-                            if http_probe["status_code"] == 200 and http_probe["body_length"] > 500:
-                                _log(f"HTTP OK after {(_rpoll + 1) * 2}s recompilation poll")
-                                break
-                        except Exception:
-                            pass
                 else:
-                    _log("Recompilation not detected after 20s — proceeding")
+                    _log("Recompilation not detected after 45s — proceeding")
             else:
                 _log("No fixes applied")
                 break
