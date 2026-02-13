@@ -35,6 +35,7 @@ interface HeaderProps {
   reactivatingId: string | null;
   fetchHistory: () => void;
   cloneId: string;
+  onExport: (cloneId: string, e?: React.MouseEvent) => void;
 }
 
 const Header: React.FC<HeaderProps> = ({
@@ -43,7 +44,7 @@ const Header: React.FC<HeaderProps> = ({
   isCloning, elapsedTime, onClone, onStop, onNewClone, onBack,
   history, showHistory, setShowHistory,
   onHistoryClick, onDeleteClone, onToggleActive, onReactivate,
-  reactivatingId, fetchHistory, cloneId,
+  reactivatingId, fetchHistory, cloneId, onExport,
 }) => {
   const [showUserMenu, setShowUserMenu] = React.useState(false);
 
@@ -153,11 +154,20 @@ const Header: React.FC<HeaderProps> = ({
           <span className="text-[9px] uppercase tracking-widest text-gray-500 font-mono">Live</span>
         </div>
 
-        {/* Clone ID badge */}
+        {/* Clone ID badge + export */}
         {cloneId && (
-          <span className="text-[9px] font-mono text-gray-600 mr-1 hidden sm:inline">
-            {cloneId.slice(0, 8)}
-          </span>
+          <>
+            <span className="text-[9px] font-mono text-gray-600 mr-0.5 hidden sm:inline">
+              {cloneId.slice(0, 8)}
+            </span>
+            <button
+              onClick={(e) => onExport(cloneId, e)}
+              className="p-1.5 rounded hover:bg-white/10 text-gray-400 hover:text-emerald-400 transition-colors"
+              title="Export files as .zip"
+            >
+              <span className="material-symbols-outlined text-[16px]">download</span>
+            </button>
+          </>
         )}
 
         {/* History */}
@@ -232,6 +242,14 @@ const Header: React.FC<HeaderProps> = ({
                                 className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
                               >
                                 {reactivatingId === record.id ? 'Starting...' : 'Reactivate'}
+                              </button>
+                            )}
+                            {hasSaved && (
+                              <button
+                                onClick={(e) => onExport(record.id, e)}
+                                className="px-1.5 py-0.5 rounded text-[9px] font-mono text-gray-600 hover:bg-emerald-500/10 hover:text-emerald-400 transition-colors"
+                              >
+                                Export
                               </button>
                             )}
                             <button

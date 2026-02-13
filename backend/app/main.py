@@ -516,3 +516,110 @@ async def stop_clone_endpoint(request: StopCloneRequest):
             pass
 
     return {"status": "stopped", "sandbox_id": sandbox_id}
+
+
+@app.post("/sandboxes/cleanup")
+async def cleanup_all_sandboxes():
+    """
+    Delete ALL active Daytona sandboxes on startup.
+    Preserves all Supabase data (files, metadata, history) — only removes
+    the live sandbox references so clones can still be reactivated later.
+    """
+    from app.agent import active_sandboxes, _chat_sessions
+    from app.database import _get_client as get_db
+
+    deleted = []
+    errors = []
+
+    # 1. Delete all in-memory tracked sandboxes
+    sandbox_ids_done = set()
+    for sid in list(active_sandboxes.keys()):
+        try:
+            from app.sandbox import stop_sandbox
+            await stop_sandbox(sid, delete=True)
+            deleted.append(sid)
+        except Exception as e:
+            errors.append(f"{sid[:12]}: {e}")
+        sandbox_ids_done.add(sid)
+    active_sandboxes.clear()
+    _chat_sessions.clear()
+
+    # 2. Find any active clones in DB that still have a sandbox_id and delete those too
+    try:
+        db = get_db()
+        result = (
+            db.table("clones")
+            .select("id, sandbox_id")
+            .not_.is_("sandbox_id", "null")
+            .execute()
+        )
+        for row in (result.data or []):
+            sid = row.get("sandbox_id")
+            if sid and sid not in sandbox_ids_done:
+                try:
+                    from app.sandbox import stop_sandbox
+                    await stop_sandbox(sid, delete=True)
+                    deleted.append(sid)
+                except Exception as e:
+                    errors.append(f"{sid[:12]}: {e}")
+
+        # Clear sandbox references and mark inactive — files/metadata stay intact
+        db.table("clones").update({
+            "is_active": False,
+            "sandbox_id": None,
+        }).not_.is_("sandbox_id", "null").execute()
+    except Exception as e:
+        errors.append(f"DB cleanup: {e}")
+
+    print(f"[cleanup] Deleted {len(deleted)} sandbox(es), {len(errors)} error(s)")
+    return {"status": "cleaned", "deleted": len(deleted), "errors": errors}
+
+
+@app.get("/clone/{clone_id}/export")
+async def export_clone_files(clone_id: str):
+    """
+    Export all files for a clone as a downloadable .zip.
+    Pulls from in-memory session first, falls back to Supabase metadata.
+    """
+    import io
+    import zipfile
+    from fastapi.responses import Response
+    from app.agent import _chat_sessions
+
+    # Get files from session or DB
+    files = {}
+    session = _chat_sessions.get(clone_id)
+    if session:
+        files = session.get("files") or session.get("state", {}).get("files", {})
+
+    if not files:
+        try:
+            from app.database import get_clone
+            clone = await get_clone(clone_id)
+            if not clone:
+                raise HTTPException(status_code=404, detail="Clone not found")
+            metadata = clone.get("metadata") or {}
+            files = metadata.get("files") or {}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No files found for this clone")
+
+    # Build zip in memory
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filepath, content in files.items():
+            zf.writestr(filepath, content)
+    buf.seek(0)
+
+    # Use clone_id prefix for the filename
+    filename = f"clone-{clone_id[:8]}.zip"
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

@@ -276,6 +276,7 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
 
         # Signed URL embeds directly in iframes without Daytona's preview page
         preview_url = _get_iframe_preview_url(sandbox, 3000)
+        _notify(f"Sandbox ID: {sandbox.id} — Preview URL: {preview_url}")
 
         # Read key project files
         initial_files = _read_sandbox_files(sandbox, PROJECT_PATH)

@@ -27,10 +27,11 @@ interface LandingPageProps {
   onToggleActive: (record: CloneRecord, e: React.MouseEvent) => void;
   onReactivate: (record: CloneRecord) => void;
   reactivatingId: string | null;
+  onExport: (cloneId: string, e?: React.MouseEvent) => void;
 }
 
 const LandingPage: React.FC<LandingPageProps> = ({
-  onStart, history, onHistoryClick, onDeleteClone, onToggleActive, onReactivate, reactivatingId,
+  onStart, history, onHistoryClick, onDeleteClone, onToggleActive, onReactivate, reactivatingId, onExport,
 }) => {
   const [url, setUrl] = useState('');
 
@@ -157,6 +158,14 @@ const LandingPage: React.FC<LandingPageProps> = ({
                           className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
                         >
                           {reactivatingId === record.id ? 'Starting...' : 'Reactivate'}
+                        </button>
+                      )}
+                      {hasSaved && (
+                        <button
+                          onClick={(e) => onExport(record.id, e)}
+                          className="px-1.5 py-0.5 rounded text-[9px] font-mono text-gray-600 hover:bg-emerald-500/10 hover:text-emerald-400 transition-colors"
+                        >
+                          Export
                         </button>
                       )}
                       <button

@@ -75,6 +75,12 @@ const App: React.FC = () => {
   // keep a mutable ref for isCloning so fire-and-forget callbacks see latest
   const isCloningRef = useRef(isCloning);
   useEffect(() => { isCloningRef.current = isCloning; }, [isCloning]);
+  // keep a mutable ref for previewUrl so SSE callbacks see latest
+  const previewUrlRef = useRef(previewUrl);
+  useEffect(() => { previewUrlRef.current = previewUrl; }, [previewUrl]);
+  // keep a mutable ref for url so SSE callbacks see latest
+  const urlRef = useRef(url);
+  useEffect(() => { urlRef.current = url; }, [url]);
 
   const currentSession = sessions.find(s => s.id === currentSessionId) || sessions[0];
 
@@ -114,11 +120,13 @@ const App: React.FC = () => {
   }, [isCloning]);
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Fetch history
+  // Cleanup all sandboxes on launch
   // ═══════════════════════════════════════════════════════════════════════
 
   useEffect(() => {
-    fetchHistory();
+    fetch(`${API_URL}/sandboxes/cleanup`, { method: 'POST' })
+      .then(() => fetchHistory())
+      .catch(() => fetchHistory());
   }, []);
 
   useEffect(() => {
@@ -220,7 +228,7 @@ const App: React.FC = () => {
         addMsg({
           sender: Sender.SYSTEM,
           text: `Connection lost: ${streamErr?.message || 'network error'}. The clone may still be running on the server.`,
-          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: url },
+          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: urlRef.current },
         });
       }
     }
@@ -286,7 +294,15 @@ const App: React.FC = () => {
           metadata: { domUpdateStatus: 'Live preview ready', previewUrl: event.preview_url, eventType: 'deployed' },
         });
         setTimeout(() => {
-          if (iframeRef.current) iframeRef.current.src = event.preview_url;
+          if (iframeRef.current) {
+            try {
+              const u = new URL(event.preview_url);
+              u.searchParams.set('_t', Date.now().toString());
+              iframeRef.current.src = u.toString();
+            } catch {
+              iframeRef.current.src = event.preview_url;
+            }
+          }
         }, 3000);
         break;
 
@@ -313,8 +329,18 @@ const App: React.FC = () => {
           metadata: { domUpdateStatus: 'Compiled', eventType: 'compiled' },
         });
         // Reload iframe so the user sees the freshly compiled clone
+        // Use previewUrlRef to avoid stale closure
         setTimeout(() => {
-          if (iframeRef.current && previewUrl) iframeRef.current.src = previewUrl;
+          const currentUrl = previewUrlRef.current;
+          if (iframeRef.current && currentUrl) {
+            try {
+              const u = new URL(currentUrl);
+              u.searchParams.set('_t', Date.now().toString());
+              iframeRef.current.src = u.toString();
+            } catch {
+              iframeRef.current.src = currentUrl;
+            }
+          }
         }, 1500);
         break;
 
@@ -404,7 +430,7 @@ const App: React.FC = () => {
         addMsg({
           sender: Sender.SYSTEM,
           text: `Error: ${event.message}`,
-          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: url },
+          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: urlRef.current },
         });
         break;
 
@@ -421,13 +447,21 @@ const App: React.FC = () => {
             metadata: { domUpdateStatus: 'Clone finished', eventType: 'done' },
           });
           setTimeout(() => {
-            if (iframeRef.current && event.preview_url) iframeRef.current.src = event.preview_url;
+            if (iframeRef.current && event.preview_url) {
+              try {
+                const u = new URL(event.preview_url);
+                u.searchParams.set('_t', Date.now().toString());
+                iframeRef.current.src = u.toString();
+              } catch {
+                iframeRef.current.src = event.preview_url;
+              }
+            }
           }, 2000);
         } else {
           addMsg({
             sender: Sender.SYSTEM,
             text: `Clone incomplete — sandbox was not created. You can retry the clone.`,
-            metadata: { domUpdateStatus: 'Clone incomplete', eventType: 'done', cloneIncomplete: true, retryUrl: url },
+            metadata: { domUpdateStatus: 'Clone incomplete', eventType: 'done', cloneIncomplete: true, retryUrl: urlRef.current },
           });
         }
         fetchHistory();
@@ -707,6 +741,28 @@ const App: React.FC = () => {
   };
 
   // ═══════════════════════════════════════════════════════════════════════
+  // Export / Download
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const handleExport = async (exportCloneId: string, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    if (!exportCloneId) return;
+    try {
+      const res = await fetch(`${API_URL}/clone/${exportCloneId}/export`);
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `clone-${exportCloneId.slice(0, 8)}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch { /* silent */ }
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
   // Session management
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -777,6 +833,7 @@ const App: React.FC = () => {
         onToggleActive={handleToggleActive}
         onReactivate={handleReactivate}
         reactivatingId={reactivatingId}
+        onExport={handleExport}
       />
     );
   }
@@ -806,6 +863,7 @@ const App: React.FC = () => {
         reactivatingId={reactivatingId}
         fetchHistory={fetchHistory}
         cloneId={cloneId}
+        onExport={handleExport}
       />
 
       <main className="flex-1 flex overflow-hidden flex-col md:flex-row">
