@@ -32,6 +32,21 @@ def get_daytona_client() -> Daytona:
     return Daytona(DaytonaConfig(api_key=_get_api_key()))
 
 
+def _get_iframe_preview_url(sandbox, port: int) -> str:
+    """Get a preview URL suitable for iframe embedding (no Daytona preview page).
+
+    Uses create_signed_preview_url which returns a self-contained URL that
+    bypasses Daytona's interstitial preview page. Falls back to
+    get_preview_link if signing fails.
+    """
+    try:
+        signed = sandbox.create_signed_preview_url(port, expires_in_seconds=7200)
+        return signed.url if hasattr(signed, 'url') else str(signed)
+    except Exception:
+        preview = sandbox.get_preview_link(port)
+        return preview.url
+
+
 # ── Next.js Project Setup (bun create next-app@latest) ─────────────────────
 
 PROJECT_PATH = "/home/daytona/my-app"
@@ -232,9 +247,8 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         if not ready:
             _notify("Timeout waiting for Next.js — proceeding anyway")
 
-        # Public sandbox — get_preview_link returns a direct URL (no auth frame)
-        preview = sandbox.get_preview_link(3000)
-        preview_url = preview.url
+        # Signed URL embeds directly in iframes without Daytona's preview page
+        preview_url = _get_iframe_preview_url(sandbox, 3000)
 
         # Read key project files
         initial_files = _read_sandbox_files(sandbox, PROJECT_PATH)
@@ -316,9 +330,8 @@ async def start_sandbox(sandbox_id: str) -> dict:
         sandbox.process.exec(start_cmd)
         time.sleep(5)
 
-        # Public sandbox — get_preview_link returns a direct URL (no auth frame)
-        preview = sandbox.get_preview_link(3000)
-        preview_url = preview.url
+        # Signed URL embeds directly in iframes without Daytona's preview page
+        preview_url = _get_iframe_preview_url(sandbox, 3000)
         print(f"Sandbox {sandbox_id} started — preview: {preview_url}")
         return {
             "preview_url": preview_url,
