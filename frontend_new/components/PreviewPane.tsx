@@ -133,7 +133,7 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({
             src={previewUrl}
             className="flex-1 w-full bg-white"
             title="Clone preview"
-            sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+            allow="cross-origin-isolated"
             onError={() => console.warn('iframe error:', previewUrl)}
           />
         ) : (

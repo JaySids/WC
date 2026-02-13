@@ -255,12 +255,17 @@ async def provision_react_sandbox_from_template() -> dict:
         if not ready:
             print("  [template] Timeout waiting for Next.js — proceeding anyway")
 
-        # Get preview URL
-        preview = sandbox.get_preview_link(3000)
+        # Get preview URL — signed URL for iframe embedding
+        try:
+            signed = sandbox.create_signed_preview_url(3000, expires_in_seconds=7200)
+            preview_url = signed.url if hasattr(signed, 'url') else str(signed)
+        except Exception:
+            preview = sandbox.get_preview_link(3000)
+            preview_url = preview.url
 
         return {
             "sandbox_id": sandbox.id,
-            "preview_url": preview.url,
+            "preview_url": preview_url,
             "project_root": project_root,
         }
 
