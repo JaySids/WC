@@ -72,7 +72,7 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
     const isUser = msg.sender === Sender.USER;
     const meta = msg.metadata || {};
 
-    // Determine styling based on fix_step phase
+    // Determine styling based on event type
     let borderAccent = 'border-transparent';
     if (meta.eventType === 'fix_step') {
       const phase = meta.phase || '';
@@ -80,10 +80,15 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
       else if (phase.includes('clean') || phase.includes('fixed')) borderAccent = 'border-emerald-500/50';
       else if (phase.includes('issues') || phase.includes('errors')) borderAccent = 'border-yellow-500/50';
       else borderAccent = 'border-blue-500/50';
+    } else if (meta.eventType === 'runtime_errors') {
+      borderAccent = 'border-red-500/50';
+    } else if (meta.eventType === 'compile_errors') {
+      borderAccent = 'border-yellow-500/50';
     }
 
+    const hasAccent = meta.eventType === 'fix_step' || meta.eventType === 'runtime_errors' || meta.eventType === 'compile_errors';
     const bgClass = isUser ? 'bg-[#121214]/50 hover:bg-[#121214]' : 'hover:bg-white/[0.02]';
-    const userBorder = isUser ? 'border-l-2 border-blue-500/50' : `border-l-2 ${meta.eventType === 'fix_step' ? borderAccent : 'border-transparent hover:border-gray-700'}`;
+    const userBorder = isUser ? 'border-l-2 border-blue-500/50' : `border-l-2 ${hasAccent ? borderAccent : 'border-transparent hover:border-gray-700'}`;
 
     return (
       <div key={msg.id} className={`flex gap-0 py-3 px-4 group relative transition-colors ${bgClass} ${userBorder}`}>
@@ -133,11 +138,15 @@ const TerminalPane: React.FC<TerminalPaneProps> = ({
           {/* Error list */}
           {meta.errors && meta.errors.length > 0 && (
             <div className="mt-1.5 space-y-0.5">
-              {meta.errors.slice(0, 5).map((err, i) => (
-                <p key={i} className="text-[10px] text-gray-500 font-mono">- {err}</p>
-              ))}
-              {meta.errors.length > 5 && (
-                <p className="text-[10px] text-gray-600 font-mono">...and {meta.errors.length - 5} more</p>
+              {meta.errors.slice(0, 8).map((err, i) => {
+                const isRuntime = meta.eventType === 'runtime_errors';
+                const colorClass = isRuntime ? 'text-red-400/80' : 'text-yellow-500/70';
+                return (
+                  <p key={i} className={`text-[10px] ${colorClass} font-mono`}>- {err}</p>
+                );
+              })}
+              {meta.errors.length > 8 && (
+                <p className="text-[10px] text-gray-600 font-mono">...and {meta.errors.length - 8} more</p>
               )}
             </div>
           )}

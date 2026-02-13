@@ -292,18 +292,53 @@ const App: React.FC = () => {
           text: event.message || 'Compiled successfully',
           metadata: { domUpdateStatus: 'Compiled', eventType: 'compiled' },
         });
+        // Reload iframe so the user sees the freshly compiled clone
+        setTimeout(() => {
+          if (iframeRef.current && previewUrl) iframeRef.current.src = previewUrl;
+        }, 1500);
         break;
 
-      case 'compile_errors':
+      case 'compile_errors': {
+        const compErrors: string[] = [];
+        if (event.errors?.length) {
+          for (const e of event.errors.slice(0, 6)) {
+            const loc = e.file ? `${e.file}${e.line ? `:${e.line}` : ''}` : '';
+            compErrors.push(loc ? `[${loc}] ${e.message}` : e.message);
+          }
+          if (event.error_count > 6) compErrors.push(`...and ${event.error_count - 6} more`);
+        } else if (event.report) {
+          compErrors.push(event.report);
+        }
         addMsg({
           sender: Sender.BOT,
           text: `Compilation errors (attempt ${event.attempt || '?'}/3): ${event.error_count || 0} error${(event.error_count || 0) !== 1 ? 's' : ''}`,
           metadata: {
-            errors: event.report ? [event.report] : [],
+            errors: compErrors,
             eventType: 'compile_errors',
           },
         });
         break;
+      }
+
+      case 'runtime_errors': {
+        const rtErrors: string[] = [];
+        if (event.errors?.length) {
+          for (const e of event.errors.slice(0, 6)) {
+            const loc = e.file ? `${e.file}${e.line ? `:${e.line}` : ''}` : '';
+            rtErrors.push(loc ? `[${loc}] ${e.message}` : e.message);
+          }
+          if (event.error_count > 6) rtErrors.push(`...and ${event.error_count - 6} more`);
+        }
+        addMsg({
+          sender: Sender.BOT,
+          text: `Runtime errors (attempt ${event.attempt || '?'}/3): ${event.error_count || 0} error${(event.error_count || 0) !== 1 ? 's' : ''}`,
+          metadata: {
+            errors: rtErrors,
+            eventType: 'runtime_errors',
+          },
+        });
+        break;
+      }
 
       case 'warning':
         addMsg({

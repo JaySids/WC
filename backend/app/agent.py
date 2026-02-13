@@ -608,19 +608,59 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
     # ============================================================
     # [A + B] SCRAPE + SANDBOX in parallel
+    # Emit `deployed` as soon as sandbox is ready so the user
+    # sees the default Next.js page in the iframe immediately.
     # ============================================================
     yield sse_event("step", {"step": "scraping", "message": f"Scraping {url}..."})
 
     scrape_task = asyncio.create_task(scrape_website(url))
     sandbox_task = asyncio.create_task(create_react_boilerplate_sandbox())
 
-    try:
-        scrape_data = await scrape_task
-    except Exception as e:
-        _log(f"Scrape failed: {e}")
-        yield sse_event("error", {"message": f"Scrape failed: {e}"})
-        yield sse_event("done", {"preview_url": None, "error": str(e)})
-        return
+    pending = {scrape_task, sandbox_task}
+    scrape_data = None
+    sandbox_info = None
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task is sandbox_task:
+                try:
+                    sandbox_info = task.result()
+                except Exception as e:
+                    _log(f"Sandbox acquisition failed: {e}")
+                    # Cancel the other task and bail out
+                    for t in pending:
+                        t.cancel()
+                    yield sse_event("error", {"message": f"Sandbox failed: {e}"})
+                    yield sse_event("done", {"preview_url": None, "error": str(e)})
+                    return
+
+                state["sandbox_id"] = sandbox_info["sandbox_id"]
+                state["preview_url"] = sandbox_info["preview_url"]
+                state["project_root"] = sandbox_info.get("project_root", PROJECT_PATH)
+
+                active_sandboxes[sandbox_info["sandbox_id"]] = {
+                    **sandbox_info,
+                    "created_at": time.time(),
+                }
+
+                _log(f"Sandbox ready: {sandbox_info['sandbox_id'][:12]} — {sandbox_info['preview_url']}")
+
+                yield sse_event("deployed", {
+                    "preview_url": sandbox_info["preview_url"],
+                    "sandbox_id": sandbox_info["sandbox_id"],
+                })
+
+            elif task is scrape_task:
+                try:
+                    scrape_data = task.result()
+                except Exception as e:
+                    _log(f"Scrape failed: {e}")
+                    for t in pending:
+                        t.cancel()
+                    yield sse_event("error", {"message": f"Scrape failed: {e}"})
+                    yield sse_event("done", {"preview_url": state.get("preview_url"), "error": str(e)})
+                    return
 
     sections_raw = scrape_data.get("sections", [])
     images_raw = scrape_data.get("assets", {}).get("images", [])
@@ -754,31 +794,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     # ============================================================
     # [D] UPLOAD TO SANDBOX
     # ============================================================
-    yield sse_event("step", {"step": "deploying", "message": "Deploying to sandbox..."})
-
-    try:
-        sandbox_info = await sandbox_task
-    except Exception as e:
-        _log(f"Sandbox acquisition failed: {e}")
-        yield sse_event("error", {"message": f"Sandbox failed: {e}"})
-        yield sse_event("done", {"preview_url": None, "error": str(e)})
-        return
-
-    state["sandbox_id"] = sandbox_info["sandbox_id"]
-    state["preview_url"] = sandbox_info["preview_url"]
-    state["project_root"] = sandbox_info.get("project_root", PROJECT_PATH)
-
-    active_sandboxes[sandbox_info["sandbox_id"]] = {
-        **sandbox_info,
-        "created_at": time.time(),
-    }
-
-    _log(f"Sandbox ready: {sandbox_info['sandbox_id'][:12]} — {sandbox_info['preview_url']}")
-
-    yield sse_event("deployed", {
-        "preview_url": sandbox_info["preview_url"],
-        "sandbox_id": sandbox_info["sandbox_id"],
-    })
+    yield sse_event("step", {"step": "deploying", "message": "Uploading files to sandbox..."})
 
     # Remove conflicting .tsx scaffold files before uploading .jsx
     tsx_to_remove = []
@@ -857,13 +873,19 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                            f"_diagnostics/server_logs_attempt{attempt+1}.txt", logs)
         parsed = parse_nextjs_errors(logs)
         runtime = parse_runtime_errors(logs)
-        combined_errors = parsed["errors"] + runtime["errors"]
-        combined_errors = _filter_errors_to_generated(combined_errors, state["files"])
-        parsed["errors"] = combined_errors
-        parsed["has_errors"] = parsed["has_errors"] or runtime["has_errors"]
 
-        # Step 2: If compiled, verify via HTTP
-        if parsed["compiled"] and not parsed["has_errors"]:
+        # Track compilation and runtime errors separately
+        compilation_errors = _filter_errors_to_generated(parsed["errors"], state["files"])
+        runtime_errors_list = _filter_errors_to_generated(runtime["errors"], state["files"])
+
+        # Combined for internal fix logic
+        combined_errors = compilation_errors + runtime_errors_list
+        parsed["errors"] = combined_errors
+        has_errors = len(combined_errors) > 0 or parsed["has_errors"] or runtime["has_errors"]
+
+        # Step 2: If compiled with no log errors, verify via HTTP
+        http_runtime_errors = []
+        if parsed["compiled"] and not has_errors:
             _log("Server logs say compiled — verifying page renders...")
             http_result = await _check_sandbox_http(sandbox_info["sandbox_id"])
 
@@ -874,19 +896,17 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                 break
             else:
                 _log(f"Page has runtime errors: {http_result['errors']}")
-                runtime_errors = []
                 for err_indicator in http_result["errors"]:
-                    runtime_errors.append({
+                    http_runtime_errors.append({
                         "type": "runtime_error",
                         "file": None,
                         "line": None,
-                        "message": f"Runtime error detected on page: {err_indicator}",
+                        "message": f"Runtime error on page: {err_indicator}",
                     })
-                runtime_errors = _filter_errors_to_generated(runtime_errors, state["files"])
-                parsed["errors"].extend(runtime_errors)
-                parsed["has_errors"] = True
+                has_errors = True
 
-        if not parsed["has_errors"]:
+        # If nothing detected yet (not compiled or inconclusive)
+        if not has_errors and not http_runtime_errors:
             if attempt < 2:
                 _log("Not compiled yet, waiting 15s...")
                 await asyncio.sleep(15)
@@ -902,20 +922,47 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                     })
                 break
 
-        error_report = format_nextjs_errors(parsed)
-        _log(f"Errors found ({len(parsed['errors'])}): {error_report[:200]}")
+        # Emit separate events for compilation and runtime errors
+        if compilation_errors:
+            comp_report = format_nextjs_errors({**parsed, "errors": compilation_errors, "has_errors": True})
+            _log(f"Compilation errors ({len(compilation_errors)}): {comp_report[:200]}")
+            yield sse_event("compile_errors", {
+                "attempt": attempt + 1,
+                "error_count": len(compilation_errors),
+                "report": comp_report[:500],
+                "errors": [
+                    {"file": e.get("file"), "line": e.get("line"), "message": e.get("message", "")[:200]}
+                    for e in compilation_errors[:8]
+                ],
+            })
 
-        yield sse_event("compile_errors", {
-            "attempt": attempt + 1,
-            "error_count": len(parsed["errors"]),
-            "report": error_report[:500],
-        })
+        all_runtime = runtime_errors_list + http_runtime_errors
+        if all_runtime:
+            _log(f"Runtime errors ({len(all_runtime)})")
+            yield sse_event("runtime_errors", {
+                "attempt": attempt + 1,
+                "error_count": len(all_runtime),
+                "errors": [
+                    {"file": e.get("file"), "line": e.get("line"), "message": e.get("message", "")[:200]}
+                    for e in all_runtime[:8]
+                ],
+            })
+
+        # Fallback: has_errors flag set but no individually parsed errors
+        if not compilation_errors and not all_runtime:
+            error_report = format_nextjs_errors(parsed)
+            _log(f"Errors detected: {error_report[:200]}")
+            yield sse_event("compile_errors", {
+                "attempt": attempt + 1,
+                "error_count": 0,
+                "report": error_report[:500],
+            })
 
         if attempt < 2:
             # Handle missing module imports
             missing_fixed = {}
             remaining_errors = []
-            for err in parsed["errors"]:
+            for err in combined_errors:
                 if err.get("type") == "module_not_found" and err.get("module"):
                     mod = err["module"]
                     comp_path = mod.lstrip("./").lstrip("../")
@@ -993,10 +1040,12 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                     list(fixed.keys()),
                     state["project_root"],
                 )
-                _log(f"Fixed {len(fixed)} files, waiting 15s...")
+
+                yield sse_event("step", {"step": "verifying", "message": "Verifying fix..."})
+                _log(f"Fixed {len(fixed)} files, waiting 15s for recompilation...")
                 await asyncio.sleep(15)
             else:
-                _log("Fix agent returned no changes")
+                _log("No fixes applied")
                 break
 
     # ============================================================
