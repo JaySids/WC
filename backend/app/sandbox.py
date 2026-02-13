@@ -187,6 +187,21 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
             f"{PROJECT_PATH}/components/ErrorBoundary.tsx",
         )
 
+        # Replace default layout.tsx to avoid Turbopack font resolution error
+        # (create-next-app scaffolds Geist font via next/font/google which breaks
+        # under bun's runtime — the agent overwrites layout.tsx during generation anyway)
+        _minimal_layout = (
+            'import "./globals.css";\n'
+            'export const metadata = { title: "Clone", description: "Website clone" };\n'
+            'export default function RootLayout({ children }: { children: React.ReactNode }) {\n'
+            '  return <html lang="en"><body>{children}</body></html>;\n'
+            '}\n'
+        )
+        sandbox.fs.upload_file(
+            _minimal_layout.encode("utf-8"),
+            f"{PROJECT_PATH}/app/layout.tsx",
+        )
+
         # Start dev server
         _notify("Starting Next.js dev server...")
         log_file = f"{PROJECT_PATH}/server.log"
