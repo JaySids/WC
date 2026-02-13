@@ -173,9 +173,10 @@ async def _check_sandbox_http(sandbox_id: str) -> dict:
                 "status_code": status_code,
                 "errors": errors,
                 "body_length": len(body),
+                "body": body[:3000],
             }
         except Exception as e:
-            return {"ok": False, "status_code": 0, "errors": [str(e)], "body_length": 0}
+            return {"ok": False, "status_code": 0, "errors": [str(e)], "body_length": 0, "body": ""}
     return await asyncio.to_thread(_check)
 
 
@@ -896,14 +897,16 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                 break
             else:
                 _log(f"Page has runtime errors: {http_result['errors']}")
+                body_snippet = http_result.get("body", "")[:500]
                 for err_indicator in http_result["errors"]:
                     http_runtime_errors.append({
                         "type": "runtime_error",
-                        "file": None,
+                        "file": "app/page.jsx",
                         "line": None,
-                        "message": f"Runtime error on page: {err_indicator}",
+                        "message": f"Runtime error on page: {err_indicator}\nPage HTML snippet: {body_snippet}",
                     })
                 has_errors = True
+                combined_errors.extend(http_runtime_errors)
 
         # If nothing detected yet (not compiled or inconclusive)
         if not has_errors and not http_runtime_errors:
@@ -957,6 +960,24 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                 "error_count": 0,
                 "report": error_report[:500],
             })
+
+        # If we only have HTTP runtime errors (no log-parsed errors),
+        # fetch fresh logs — the dev server often logs the actual stack trace
+        if http_runtime_errors and not compilation_errors and not runtime_errors_list:
+            try:
+                fresh_logs = await get_sandbox_logs(
+                    sandbox_info["sandbox_id"], state["project_root"], lines=200
+                )
+                fresh_parsed = parse_nextjs_errors(fresh_logs)
+                fresh_runtime = parse_runtime_errors(fresh_logs)
+                fresh_errors = _filter_errors_to_generated(
+                    fresh_parsed["errors"] + fresh_runtime["errors"], state["files"]
+                )
+                if fresh_errors:
+                    _log(f"Fresh logs revealed {len(fresh_errors)} additional errors")
+                    combined_errors.extend(fresh_errors)
+            except Exception:
+                pass
 
         if attempt < 2:
             # Handle missing module imports
@@ -1013,6 +1034,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                     fixed = await fix_targeted(
                         state["files"], remaining_errors, "compilation/runtime",
                         prior_context=prior_context,
+                        all_files=state["files"] if http_runtime_errors else None,
                     )
                 except Exception as fix_err:
                     _log(f"Fix agent failed: {fix_err}")
@@ -1107,7 +1129,8 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 # ---------------------------------------------------------------
 
 async def fix_targeted(
-    files: dict, errors: list, error_source: str, prior_context: str = ""
+    files: dict, errors: list, error_source: str, prior_context: str = "",
+    all_files: dict | None = None,
 ) -> dict:
     """
     Single Claude call to fix specific errors in specific files.
@@ -1128,6 +1151,8 @@ async def fix_targeted(
     if prior_context:
         parts.append(prior_context)
 
+    has_runtime_errors = any(e.get("type") == "runtime_error" for e in errors)
+
     for fp, errs in by_file.items():
         parts.append(f"\n--- {fp} ---")
         for e in errs:
@@ -1143,6 +1168,18 @@ async def fix_targeted(
                 break
         if match:
             parts.append(f"CODE:\n```\n{files[match]}\n```")
+
+    # For runtime errors, include ALL generated files so Claude can trace the issue
+    if has_runtime_errors and all_files:
+        already_shown = set(by_file.keys())
+        extra_files = {
+            fp: content for fp, content in all_files.items()
+            if fp not in already_shown and fp.endswith((".jsx", ".tsx", ".css", ".js"))
+        }
+        if extra_files:
+            parts.append("\n--- ALL PROJECT FILES (for runtime error context) ---")
+            for fp, content in extra_files.items():
+                parts.append(f"\n--- {fp} ---\nCODE:\n```\n{content}\n```")
 
     try:
         text = ""

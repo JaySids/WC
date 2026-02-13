@@ -470,9 +470,9 @@ async def stop_clone_endpoint(request: StopCloneRequest):
     if sandbox_id:
         try:
             from app.sandbox import stop_sandbox
-            await stop_sandbox(sandbox_id)
+            await stop_sandbox(sandbox_id, delete=True)
         except Exception as e:
-            print(f"Failed to stop sandbox {sandbox_id}: {e}")
+            print(f"Failed to delete sandbox {sandbox_id}: {e}")
 
     if request.clone_id:
         try:

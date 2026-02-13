@@ -429,6 +429,12 @@ const App: React.FC = () => {
     const trimmedUrl = cloneUrl.trim();
     if (!trimmedUrl) return;
 
+    // Guard: don't allow double-submission while already cloning
+    if (isCloning) return;
+
+    // Deactivate the previous sandbox before starting a new one
+    deactivateCurrentClone();
+
     setUrl(trimmedUrl);
     setShowLanding(false);
     setIsCloning(true);
@@ -487,18 +493,26 @@ const App: React.FC = () => {
     setPipelineSteps([]);
     clearInterval(timerRef.current);
 
+    // Stop and delete the sandbox — a stopped mid-clone sandbox is useless
+    const stopId = cloneId || undefined;
     try {
       await fetch(`${API_URL}/clone/stop`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clone_id: cloneId || undefined }),
+        body: JSON.stringify({ clone_id: stopId }),
       });
     } catch { /* silent */ }
+
+    // Also deactivate in DB so it doesn't show as active in history
+    if (stopId) deactivateCurrentClone(stopId);
 
     addMsg({ sender: Sender.SYSTEM, text: 'Clone stopped' });
   };
 
   const handleNewClone = () => {
+    // Deactivate the current sandbox before starting fresh
+    deactivateCurrentClone();
+
     setUrl('');
     setIsCloning(false);
     setFiles({});
@@ -602,6 +616,12 @@ const App: React.FC = () => {
   };
 
   const handleReactivate = async (record: CloneRecord) => {
+    // Guard: don't allow if already reactivating or cloning
+    if (reactivatingId || isCloning) return;
+
+    // Deactivate current sandbox before spinning up a rebuilt one
+    deactivateCurrentClone();
+
     setReactivatingId(record.id);
     try {
       const res = await fetch(`${API_URL}/clone/${record.id}/rebuild`, { method: 'POST' });
