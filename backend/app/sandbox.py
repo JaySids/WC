@@ -95,13 +95,48 @@ export default class ErrorBoundary extends Component<Props, State> {
 # Extra packages installed on top of what create-next-app provides
 # Keep this minimal — fewer packages = faster sandbox creation + simpler clones
 EXTRA_PACKAGES = [
-    "framer-motion",                  # Animations (only if original site has them)
-    "lucide-react",                   # Icons
-    "@radix-ui/react-accordion",      # Accordion/FAQ sections
-    "@radix-ui/react-dialog",         # Modals
-    "@radix-ui/react-tabs",           # Tab components
-    "react-intersection-observer",    # Scroll-triggered visibility
-    "clsx", "tailwind-merge",         # className merging
+    # ── Icons ──────────────────────────────────────────────────────────────
+    "lucide-react",                       # Primary icon set (Menu, X, ChevronDown, ArrowRight, Check, Star, etc.)
+    "react-icons",                        # Mega icon pack (Font Awesome, Material, Heroicons, Bootstrap, etc.)
+
+    # ── Animation & Motion ─────────────────────────────────────────────────
+    "framer-motion",                      # Animations, transitions, scroll-triggered reveals
+    "react-countup",                      # Animated number counters (stats sections)
+    "react-type-animation",              # Typewriter text effects
+
+    # ── Carousels & Sliders ────────────────────────────────────────────────
+    "swiper",                             # Full-featured carousel/slider
+    "embla-carousel-react",              # Lightweight carousel
+    "embla-carousel-autoplay",           # Autoplay plugin for embla
+
+    # ── Radix UI Primitives ────────────────────────────────────────────────
+    "@radix-ui/react-accordion",          # Accordion / FAQ sections
+    "@radix-ui/react-dialog",            # Modals / dialogs
+    "@radix-ui/react-tabs",              # Tab components
+    "@radix-ui/react-dropdown-menu",     # Dropdown menus
+    "@radix-ui/react-navigation-menu",   # Nav menus with submenus
+    "@radix-ui/react-tooltip",           # Tooltips
+    "@radix-ui/react-popover",           # Popovers
+    "@radix-ui/react-select",            # Custom select dropdowns
+    "@radix-ui/react-switch",            # Toggle switches
+    "@radix-ui/react-checkbox",          # Checkboxes
+    "@radix-ui/react-slider",            # Range sliders
+    "@radix-ui/react-scroll-area",       # Custom scroll areas
+    "@radix-ui/react-avatar",            # Avatar components
+    "@radix-ui/react-progress",          # Progress bars
+    "@radix-ui/react-collapsible",       # Collapsible sections
+    "@radix-ui/react-separator",         # Visual separators
+    "@radix-ui/react-toast",             # Toast notifications
+
+    # ── Headless UI ────────────────────────────────────────────────────────
+    "@headlessui/react",                  # Headless accessible components (Menu, Listbox, Combobox, etc.)
+
+    # ── Utility ────────────────────────────────────────────────────────────
+    "clsx", "tailwind-merge",            # className merging
+    "class-variance-authority",          # Component variant styling (cva)
+    "react-intersection-observer",       # Scroll-triggered visibility / lazy load
+    "react-scroll",                      # Smooth scroll to sections
+    "react-player",                      # Video embeds (YouTube, Vimeo, etc.)
 ]
 
 # Key project files to read back from the sandbox for the frontend file explorer
@@ -216,40 +251,32 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                     timeout=120,
                 )
 
-                # Verify that scaffolding actually installed deps — bun create
-                # can scaffold files but fail/timeout on the install step.
+                # Always run explicit bun install — bun create often scaffolds
+                # the project but doesn't reliably finish installing deps.
+                _notify("Installing dependencies...")
+                _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
+                time.sleep(10)
+
+                # Install extra packages
+                _notify("Installing extra packages...")
+                _exec(
+                    sandbox,
+                    f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
+                    timeout=180,
+                )
+
+                # Final bun install to make sure everything is linked properly
+                _notify("Verifying all dependencies...")
+                _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
+                time.sleep(10)
+
+                # Verify next binary exists — if not, something went wrong
                 check = sandbox.process.exec(
                     f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
                     timeout=10,
                 )
                 if "MISSING" in (check.result or ""):
-                    _notify("Dependencies missing after scaffold — running bun install...")
-                    _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
-
-                    # Verify again
-                    check2 = sandbox.process.exec(
-                        f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
-                        timeout=10,
-                    )
-                    if "MISSING" in (check2.result or ""):
-                        raise RuntimeError("next binary still missing after explicit bun install")
-
-                # Install extra packages in one shot
-                _notify("Installing extra packages...")
-                _exec(
-                    sandbox,
-                    f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
-                    timeout=120,
-                )
-
-                # Final verification — bun add can sometimes nuke node_modules
-                check3 = sandbox.process.exec(
-                    f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
-                    timeout=10,
-                )
-                if "MISSING" in (check3.result or ""):
-                    _notify("Dependencies broken after bun add — reinstalling...")
-                    _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
+                    raise RuntimeError("next binary missing after all install steps")
 
                 # Upload ErrorBoundary component
                 sandbox.process.exec(f"mkdir -p {PROJECT_PATH}/components", timeout=5)

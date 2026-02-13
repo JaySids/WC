@@ -509,12 +509,49 @@ NEVER use placeholder images (placeholder.com, via.placeholder, placehold.co).
 ALWAYS use the real image URLs provided in the scrape data.
 Use `<img>` tags (NOT Next.js `<Image>`) to avoid domain configuration issues.
 
-## Available Packages (pre-installed, use ONLY when the original site has the corresponding feature)
-- framer-motion — ONLY if the original site has visible animations/transitions
-- lucide-react — for icons (Menu, X, ChevronDown, ArrowRight, Check, Star, etc.)
-- @radix-ui/react-accordion, dialog, tabs — for interactive UI if the original has it
-- react-intersection-observer — for lazy loading if needed
-- clsx + tailwind-merge — className merging utility
+## Available Packages (ALL pre-installed — use freely as needed)
+
+### Icons
+- `lucide-react` — primary icon set: `import { Menu, X, ChevronDown, ArrowRight, Check, Star, Search, Mail, Phone, MapPin, Github, Twitter, Linkedin, Facebook, Instagram, Youtube, ExternalLink, Play, Pause, Volume2, Heart, ShoppingCart, User, Settings, Bell, Calendar, Clock, Download, Upload, Trash, Edit, Copy, Share, Filter, Plus, Minus, MoreHorizontal, MoreVertical, ChevronLeft, ChevronRight, ChevronUp, ChevronsUpDown, ArrowUp, ArrowDown, ArrowLeft, Eye, EyeOff, Lock, Unlock, Shield, Zap, Globe, Code, Terminal, Database, Server, Cloud, Cpu, Smartphone, Monitor, Layers, Grid, List, BarChart, PieChart, TrendingUp, Award, Target, Sparkles, Rocket, BookOpen, GraduationCap, Briefcase, Building, Home, MessageCircle, Send, Paperclip, Image, Video, Music, File, Folder, AlertCircle, AlertTriangle, Info, HelpCircle, CheckCircle, XCircle, Loader2 } from "lucide-react"`
+- `react-icons` — mega icon pack: `import { FaGithub, FaTwitter } from "react-icons/fa"`, `import { MdEmail } from "react-icons/md"`, `import { HiOutlineMenu } from "react-icons/hi"`, `import { BsArrowRight } from "react-icons/bs"`
+
+### Animation & Motion
+- `framer-motion` — `import { motion, AnimatePresence, useInView, useScroll, useTransform } from "framer-motion"` — for fade-ins, slide-ups, scroll animations, page transitions, hover effects
+- `react-countup` — `import CountUp from "react-countup"` — animated number counters for stats sections
+- `react-type-animation` — `import { TypeAnimation } from "react-type-animation"` — typewriter text effects
+
+### Carousels & Sliders
+- `swiper` — `import { Swiper, SwiperSlide } from "swiper/react"; import { Navigation, Pagination, Autoplay, EffectFade } from "swiper/modules"; import "swiper/css"; import "swiper/css/navigation"; import "swiper/css/pagination";`
+- `embla-carousel-react` — `import useEmblaCarousel from "embla-carousel-react"; import Autoplay from "embla-carousel-autoplay"` — lightweight alternative
+
+### Radix UI Primitives (accessible, unstyled — style with Tailwind)
+- `@radix-ui/react-accordion` — FAQ / collapsible sections
+- `@radix-ui/react-dialog` — modals, drawers
+- `@radix-ui/react-tabs` — tabbed interfaces
+- `@radix-ui/react-dropdown-menu` — dropdown menus
+- `@radix-ui/react-navigation-menu` — nav bars with submenus
+- `@radix-ui/react-tooltip` — tooltips on hover
+- `@radix-ui/react-popover` — popovers
+- `@radix-ui/react-select` — custom select dropdowns
+- `@radix-ui/react-switch` — toggle switches
+- `@radix-ui/react-checkbox` — checkboxes
+- `@radix-ui/react-slider` — range sliders (pricing, filters)
+- `@radix-ui/react-scroll-area` — custom scrollable areas
+- `@radix-ui/react-avatar` — avatar with fallback
+- `@radix-ui/react-progress` — progress bars
+- `@radix-ui/react-collapsible` — collapsible sections
+- `@radix-ui/react-separator` — visual dividers
+- `@radix-ui/react-toast` — toast notifications
+
+### Headless UI
+- `@headlessui/react` — `import { Menu, Transition, Dialog, Disclosure, Listbox, Combobox, Switch, Tab } from "@headlessui/react"` — accessible components with built-in transitions
+
+### Utility
+- `clsx` + `tailwind-merge` — className merging: `cn("bg-red-500", conditional && "text-white")`
+- `class-variance-authority` — `import { cva } from "class-variance-authority"` — component variant styling
+- `react-intersection-observer` — `import { useInView } from "react-intersection-observer"` — scroll-triggered visibility
+- `react-scroll` — `import { Link as ScrollLink, animateScroll } from "react-scroll"` — smooth scroll to sections
+- `react-player` — `import ReactPlayer from "react-player"` — embed YouTube, Vimeo, etc.
 
 ## Architecture
 - Create a `lib/utils.js` with: `import { clsx } from "clsx"; import { twMerge } from "tailwind-merge"; export const cn = (...inputs) => twMerge(clsx(inputs));`
