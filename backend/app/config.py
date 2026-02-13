@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     daytona_api_key: str = ""
     supabase_url: str = ""
     supabase_key: str = ""
+    gemini_api_key: str = ""
 
     # Clone defaults
     default_model: str = "claude-sonnet-4-5-20250929"
