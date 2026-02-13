@@ -86,7 +86,7 @@ async def _clear_sandbox_logs(sandbox_id: str, project_root: str):
             sb = daytona.get(sandbox_id)
             sb.process.exec(
                 f"echo '=== LOG_MARKER_'$(date +%s)' ===' >> {project_root}/server.log",
-                timeout=5,
+                timeout=15,
             )
         except Exception:
             pass
@@ -100,7 +100,7 @@ async def _touch_sandbox_files(sandbox_id: str, filepaths: list[str], project_ro
             daytona = get_daytona_client()
             sb = daytona.get(sandbox_id)
             paths = " ".join(f"{project_root}/{fp}" for fp in filepaths)
-            sb.process.exec(f"touch {paths}", timeout=10)
+            sb.process.exec(f"touch {paths}", timeout=20)
         except Exception as e:
             print(f"  [touch] Failed: {e}")
     await asyncio.to_thread(_touch)
@@ -113,18 +113,26 @@ async def _restart_dev_server(sandbox_id: str, project_root: str):
             daytona = get_daytona_client()
             sb = daytona.get(sandbox_id)
             # Kill existing dev server
-            sb.process.exec("pkill -f next || true; pkill -f bun || true", timeout=5)
+            sb.process.exec("pkill -f next || true; pkill -f bun || true", timeout=15)
             import time as _t
-            _t.sleep(1)
+            _t.sleep(2)
             # Clear old logs
             log_file = f"{project_root}/server.log"
-            sb.process.exec(f"> {log_file}", timeout=5)
+            sb.process.exec(f"> {log_file}", timeout=10)
             # Start fresh
             start_cmd = (
                 f"nohup {BUN_BIN} --cwd {project_root} --bun next dev -p 3000 -H 0.0.0.0 "
                 f"> {log_file} 2>&1 &"
             )
-            sb.process.exec(start_cmd, timeout=10)
+            sb.process.exec(start_cmd, timeout=15)
+            # Wait briefly and verify process is running
+            _t.sleep(3)
+            check = sb.process.exec("pgrep -f 'next dev' || echo 'NOT_RUNNING'", timeout=10)
+            if check.result and "NOT_RUNNING" in check.result:
+                print("  [restart-dev] WARNING: dev server process not found after start")
+                # Try one more time
+                sb.process.exec(start_cmd, timeout=15)
+                _t.sleep(2)
         except Exception as e:
             print(f"  [restart-dev] Failed: {e}")
     await asyncio.to_thread(_restart)
@@ -144,8 +152,8 @@ async def _check_sandbox_http(sandbox_id: str, wait_before: float = 3.0) -> dict
             daytona = get_daytona_client()
             sb = daytona.get(sandbox_id)
             result = sb.process.exec(
-                "curl -s -w '\\n__HTTP_CODE__%{http_code}' http://localhost:3000/ 2>/dev/null",
-                timeout=15,
+                "curl -s -m 20 -w '\\n__HTTP_CODE__%{http_code}' http://localhost:3000/ 2>/dev/null",
+                timeout=30,
             )
             output = result.result or ""
             if "__HTTP_CODE__" in output:
@@ -991,9 +999,9 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     # ============================================================
     # [E] CHECK COMPILATION + FIX
     # ============================================================
-    _log("Polling for compilation (up to 30s)...")
+    _log("Polling for compilation (up to 60s)...")
     yield sse_event("step", {"step": "checking", "message": "Waiting for compilation..."})
-    for _poll in range(10):  # up to 30s
+    for _poll in range(20):  # up to 60s
         await asyncio.sleep(3)
         try:
             poll_logs = await get_sandbox_logs(
@@ -1007,7 +1015,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         except Exception:
             pass  # sandbox not ready yet, keep polling
     else:
-        _log("Compilation not detected after 30s — proceeding to check anyway")
+        _log("Compilation not detected after 60s — proceeding to check anyway")
 
     all_errors_seen = []   # Cumulative error tracking
     prior_fixes = {}       # Track files modified in previous attempts
@@ -1312,7 +1320,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                 yield sse_event("step", {"step": "verifying", "message": f"Verifying fix (attempt {fix_iterations})..."})
                 _log(f"Fixed {len(fixed)} files, polling for recompilation...")
                 # Smart polling instead of blind sleep
-                for _rpoll in range(10):  # up to 30s
+                for _rpoll in range(15):  # up to 45s
                     await asyncio.sleep(3)
                     try:
                         rpoll_logs = await get_sandbox_logs(
@@ -1325,7 +1333,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                     except Exception:
                         pass
                 else:
-                    _log("Recompilation not detected after 30s — proceeding")
+                    _log("Recompilation not detected after 45s — proceeding")
             else:
                 _log("No fixes applied")
                 break

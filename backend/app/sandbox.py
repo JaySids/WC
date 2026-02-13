@@ -143,7 +143,7 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         if progress:
             progress.put(msg)
 
-    def _exec(sandbox, cmd, timeout=60, retries=3):
+    def _exec(sandbox, cmd, timeout=60, retries=4):
         """Run a command with retry on transient errors."""
         for attempt in range(retries):
             try:
@@ -153,9 +153,10 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                 is_transient = any(kw in err_msg for kw in (
                     "timeout", "connection", "unavailable", "not running",
                     "not ready", "refused", "reset", "broken pipe", "eof",
+                    "resource", "busy", "temporary",
                 ))
                 if attempt < retries - 1 and is_transient:
-                    wait = 3 * (attempt + 1)
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s
                     _notify(f"  Command failed ({e}), retrying in {wait}s ({attempt + 1}/{retries})...")
                     time.sleep(wait)
                 else:
@@ -180,14 +181,18 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         # connection-refused / "not running" errors — which is why
         # "reactivating" (daytona.start) works but fresh creates crash.
         _notify("Waiting for sandbox to be ready...")
-        for _ready_attempt in range(15):          # up to ~30s
+        for _ready_attempt in range(30):          # up to ~60s
             try:
                 probe = sandbox.process.exec("echo ready", timeout=10)
                 if probe.result and "ready" in probe.result:
+                    _notify(f"Sandbox responsive after {(_ready_attempt + 1) * 2}s")
                     break
-            except Exception:
-                pass
+            except Exception as probe_err:
+                if _ready_attempt % 5 == 4:  # log every 10s
+                    _notify(f"  Still waiting for sandbox... ({(_ready_attempt + 1) * 2}s, last error: {probe_err})")
             time.sleep(2)
+        else:
+            _notify("WARNING: Sandbox not responsive after 60s — proceeding anyway")
 
         try:
             sandbox.set_autostop_interval(SANDBOX_TTL_MINUTES)
@@ -248,17 +253,17 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         )
         sandbox.process.exec(start_cmd)
 
-        # Wait for dev server — shorter poll (15 attempts x 2s = 30s max)
+        # Wait for dev server (30 attempts x 2s = 60s max)
         _notify("Waiting for compilation...")
         ready = False
-        for _ in range(15):
+        for _wait in range(30):
             time.sleep(2)
             try:
-                logs = sandbox.process.exec(f"tail -20 {log_file} 2>/dev/null", timeout=5)
+                logs = sandbox.process.exec(f"tail -20 {log_file} 2>/dev/null", timeout=10)
                 log_text = (logs.result or "").lower()
                 if "ready" in log_text or "compiled" in log_text or "✓ ready" in log_text:
                     ready = True
-                    _notify("Next.js compiled successfully")
+                    _notify(f"Next.js compiled successfully ({(_wait + 1) * 2}s)")
                     break
                 if "error" in log_text and "failed to compile" in log_text:
                     _notify("Next.js has errors but server is running")
@@ -267,7 +272,7 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
             except Exception:
                 pass
         if not ready:
-            _notify("Timeout waiting for Next.js — proceeding anyway")
+            _notify("Timeout waiting for Next.js after 60s — proceeding anyway")
 
         # Signed URL embeds directly in iframes without Daytona's preview page
         preview_url = _get_iframe_preview_url(sandbox, 3000)

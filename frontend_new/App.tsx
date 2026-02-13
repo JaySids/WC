@@ -72,6 +72,9 @@ const App: React.FC = () => {
   // keep a mutable ref for cloneId so deactivation callbacks see latest
   const cloneIdRef = useRef(cloneId);
   useEffect(() => { cloneIdRef.current = cloneId; }, [cloneId]);
+  // keep a mutable ref for isCloning so fire-and-forget callbacks see latest
+  const isCloningRef = useRef(isCloning);
+  useEffect(() => { isCloningRef.current = isCloning; }, [isCloning]);
 
   const currentSession = sessions.find(s => s.id === currentSessionId) || sessions[0];
 
@@ -136,9 +139,13 @@ const App: React.FC = () => {
   // Sandbox Deactivation — destroy sandbox on navigate away, keep in history
   // ═══════════════════════════════════════════════════════════════════════
 
-  const deactivateCurrentClone = useCallback((idToDeactivate?: string) => {
+  const deactivateCurrentClone = useCallback((idToDeactivate?: string, force?: boolean) => {
     const targetId = idToDeactivate || cloneIdRef.current;
     if (!targetId) return;
+
+    // CRITICAL: never destroy a sandbox while a clone is actively running,
+    // unless explicitly forced (e.g. user clicks Stop)
+    if (!force && isCloningRef.current) return;
 
     // Fire-and-forget: don't await, don't block navigation
     fetch(`${API_URL}/clone/${targetId}/deactivate`, { method: 'POST' })
@@ -150,11 +157,11 @@ const App: React.FC = () => {
     ));
   }, []);
 
-  // Deactivate sandbox on tab close / refresh
+  // Deactivate sandbox on tab close / refresh (but NOT if a clone is running)
   useEffect(() => {
     const handleBeforeUnload = () => {
       const id = cloneIdRef.current;
-      if (id) {
+      if (id && !isCloningRef.current) {
         navigator.sendBeacon(`${API_URL}/clone/${id}/deactivate`);
       }
     };
@@ -189,19 +196,32 @@ const App: React.FC = () => {
     if (!reader) return;
 
     let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n\n');
-      buffer = lines.pop() || '';
+    let gotDone = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try {
-          const event: AgentEvent = JSON.parse(line.slice(6));
-          handleEvent(event);
-        } catch { /* skip */ }
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const event: AgentEvent = JSON.parse(line.slice(6));
+            if (event.type === 'done') gotDone = true;
+            handleEvent(event);
+          } catch { /* skip malformed event */ }
+        }
+      }
+    } catch (streamErr: any) {
+      // Stream dropped mid-transfer (network issue, server crash, etc.)
+      if (!gotDone) {
+        addMsg({
+          sender: Sender.SYSTEM,
+          text: `Connection lost: ${streamErr?.message || 'network error'}. The clone may still be running on the server.`,
+          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: url },
+        });
       }
     }
     setIsCloning(false);
@@ -479,7 +499,15 @@ const App: React.FC = () => {
       if (error.name === 'AbortError') {
         addMsg({ sender: Sender.SYSTEM, text: 'Clone stopped by user' });
       } else {
-        addMsg({ sender: Sender.SYSTEM, text: `Error: ${error.message || 'Failed to connect'}` });
+        const msg = error.message || 'Failed to connect';
+        const isNetwork = msg.toLowerCase().includes('network') || msg.toLowerCase().includes('fetch');
+        addMsg({
+          sender: Sender.SYSTEM,
+          text: isNetwork
+            ? `Connection failed: Could not reach the server. Check that the backend is running and try again.`
+            : `Error: ${msg}`,
+          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: url },
+        });
       }
       setIsCloning(false);
     } finally {
@@ -504,7 +532,8 @@ const App: React.FC = () => {
     } catch { /* silent */ }
 
     // Also deactivate in DB so it doesn't show as active in history
-    if (stopId) deactivateCurrentClone(stopId);
+    // Force=true because user intentionally stopped
+    if (stopId) deactivateCurrentClone(stopId, true);
 
     addMsg({ sender: Sender.SYSTEM, text: 'Clone stopped' });
   };

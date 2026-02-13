@@ -141,6 +141,10 @@ async def toggle_clone_active_endpoint(clone_id: str, request: ToggleActiveReque
             raise HTTPException(status_code=404, detail="Clone not found")
 
         if not request.is_active and clone.get("sandbox_id"):
+            # GUARD: don't destroy sandbox for a clone that's still processing
+            if clone.get("status") == "processing":
+                raise HTTPException(status_code=409, detail="Clone is still processing — cannot deactivate")
+
             # Sync latest files to Supabase before destroying
             session = _chat_sessions.get(clone_id)
             if session and session.get("files"):
@@ -175,6 +179,9 @@ async def deactivate_clone_endpoint(clone_id: str):
     """
     Deactivate a clone: sync files to Supabase, delete the sandbox, mark inactive.
     Designed to be fire-and-forget from the frontend — never raises HTTPException.
+
+    IMPORTANT: Refuses to deactivate clones that are still processing (status="processing")
+    to prevent destroying sandboxes mid-clone.
     """
     try:
         from app.database import get_clone, update_clone, sync_files_to_supabase
@@ -183,6 +190,11 @@ async def deactivate_clone_endpoint(clone_id: str):
         clone = await get_clone(clone_id)
         if not clone:
             return {"status": "not_found"}
+
+        # GUARD: never destroy a sandbox for a clone that's still processing
+        if clone.get("status") == "processing":
+            print(f"[deactivate] BLOCKED — clone {clone_id[:12]} is still processing, refusing to delete sandbox")
+            return {"status": "blocked", "reason": "clone is still processing"}
 
         # Sync latest in-memory files before destroying
         session = _chat_sessions.get(clone_id)
@@ -312,14 +324,25 @@ async def rebuild_clone_endpoint(clone_id: str):
 async def clone_stream(request: CloneRequest):
     """Clone a website with real-time streaming progress via SSE."""
     from app.agent import run_clone_agent_streaming
+    from app.sse_utils import sse_event
 
     url = request.url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
     async def event_stream():
-        async for event in run_clone_agent_streaming(url):
-            yield event
+        got_done = False
+        try:
+            async for event in run_clone_agent_streaming(url):
+                if '"type": "done"' in event or '"type":"done"' in event:
+                    got_done = True
+                yield event
+        except Exception as e:
+            print(f"[clone/stream] Generator crashed: {e}")
+            yield sse_event("error", {"message": f"Server error: {e}"})
+        finally:
+            if not got_done:
+                yield sse_event("done", {"preview_url": None, "error": "Stream ended unexpectedly"})
 
     return StreamingResponse(
         event_stream(),
@@ -341,13 +364,24 @@ class ChatRequest(BaseModel):
 async def clone_chat(clone_id: str, request: ChatRequest):
     """Send a follow-up message to the agent about an existing clone."""
     from app.agent import run_chat_followup
+    from app.sse_utils import sse_event
 
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
 
     async def event_stream():
-        async for event in run_chat_followup(clone_id, request.message.strip()):
-            yield event
+        got_done = False
+        try:
+            async for event in run_chat_followup(clone_id, request.message.strip()):
+                if '"type": "done"' in event or '"type":"done"' in event:
+                    got_done = True
+                yield event
+        except Exception as e:
+            print(f"[clone/{clone_id}/chat] Generator crashed: {e}")
+            yield sse_event("error", {"message": f"Server error: {e}"})
+        finally:
+            if not got_done:
+                yield sse_event("done", {"preview_url": None, "error": "Chat stream ended unexpectedly"})
 
     return StreamingResponse(
         event_stream(),

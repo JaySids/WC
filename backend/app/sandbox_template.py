@@ -295,21 +295,22 @@ async def upload_files_to_sandbox(sandbox_id: str, files: dict, project_root: st
 
     def _upload():
         last_err = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 daytona = get_daytona_client()
                 sb = daytona.get(sandbox_id)
                 for fp, content in files.items():
                     full_path = f"{project_root}/{fp}"
                     dir_path = "/".join(full_path.split("/")[:-1])
-                    sb.process.exec(f"mkdir -p {dir_path}", timeout=5)
+                    sb.process.exec(f"mkdir -p {dir_path}", timeout=15)
                     sb.fs.upload_file(content.encode("utf-8"), full_path)
                 return  # success
             except Exception as e:
                 last_err = e
-                print(f"  [upload] Attempt {attempt+1}/3 failed: {e}")
-                if attempt < 2:
-                    _time.sleep(3)
+                print(f"  [upload] Attempt {attempt+1}/4 failed: {e}")
+                if attempt < 3:
+                    wait = 5 * (attempt + 1)  # 5s, 10s, 15s
+                    _time.sleep(wait)
         raise last_err
 
     await asyncio.to_thread(_upload)
@@ -331,20 +332,20 @@ async def get_sandbox_logs(
     def _get():
         log_file = f"{project_root}/server.log"
         last_err = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 daytona = get_daytona_client()
                 sb = daytona.get(sandbox_id)
                 result = sb.process.exec(
                     f"tail -{lines} {log_file} 2>/dev/null || echo 'No logs yet'",
-                    timeout=15,
+                    timeout=20,
                 )
                 return result.result or ""
             except Exception as e:
                 last_err = e
-                print(f"  [get_sandbox_logs] Attempt {attempt+1}/3 failed: {e}")
-                if attempt < 2:
-                    _time.sleep(2)
+                print(f"  [get_sandbox_logs] Attempt {attempt+1}/4 failed: {e}")
+                if attempt < 3:
+                    _time.sleep(3 * (attempt + 1))  # 3s, 6s, 9s
         raise last_err
 
     return await asyncio.to_thread(_get)
