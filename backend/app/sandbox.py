@@ -244,35 +244,11 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
             f"{PROJECT_PATH}/app/layout.tsx",
         )
 
-        # Start dev server
-        _notify("Starting Next.js dev server...")
-        log_file = f"{PROJECT_PATH}/server.log"
-        start_cmd = (
-            f"nohup {BUN_BIN} --cwd {PROJECT_PATH} --bun next dev -p 3000 -H 0.0.0.0 "
-            f"> {log_file} 2>&1 &"
-        )
-        sandbox.process.exec(start_cmd)
-
-        # Wait for dev server (30 attempts x 2s = 60s max)
-        _notify("Waiting for compilation...")
-        ready = False
-        for _wait in range(30):
-            time.sleep(2)
-            try:
-                logs = sandbox.process.exec(f"tail -20 {log_file} 2>/dev/null", timeout=10)
-                log_text = (logs.result or "").lower()
-                if "ready" in log_text or "compiled" in log_text or "✓ ready" in log_text:
-                    ready = True
-                    _notify(f"Next.js compiled successfully ({(_wait + 1) * 2}s)")
-                    break
-                if "error" in log_text and "failed to compile" in log_text:
-                    _notify("Next.js has errors but server is running")
-                    ready = True
-                    break
-            except Exception:
-                pass
-        if not ready:
-            _notify("Timeout waiting for Next.js after 60s — proceeding anyway")
+        # Dev server is NOT started here — it will be started fresh in agent.py
+        # after Claude generates and uploads the real files. This avoids:
+        # 1. Serving useless scaffold files initially
+        # 2. A 60s wait-for-compilation during sandbox provisioning
+        # 3. Having to restart the server after file upload
 
         # Signed URL embeds directly in iframes without Daytona's preview page
         preview_url = _get_iframe_preview_url(sandbox, 3000)
