@@ -20,11 +20,6 @@ import anthropic
 
 from app.sse_utils import sse_event
 from app.scraper import scrape_website
-from app.nextjs_error_parser import (
-    parse_nextjs_errors,
-    parse_runtime_errors,
-    format_nextjs_errors,
-)
 from app.sandbox import PROJECT_PATH, BUN_BIN, get_daytona_client, create_react_boilerplate_sandbox
 from app.sandbox_template import upload_files_to_sandbox, get_sandbox_logs
 
@@ -224,25 +219,139 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def _filter_errors_to_generated(errors: list, generated_files: dict) -> list:
-    """Keep only errors that map to generated files."""
-    if not errors:
-        return []
-    allowed = set(generated_files.keys())
-    filtered = []
-    for err in errors:
-        fp = err.get("file")
-        if not fp:
-            continue
-        if fp in allowed:
-            filtered.append(err)
-            continue
-        # Fallback: match by suffix
-        match = next((a for a in allowed if a.endswith(fp) or fp.endswith(a)), None)
-        if match:
-            err = {**err, "file": match}
-            filtered.append(err)
-    return filtered
+# ---------------------------------------------------------------
+# AI-DRIVEN ERROR DIAGNOSIS + FIX
+# ---------------------------------------------------------------
+
+async def _diagnose_and_fix(
+    source_files: dict[str, str],
+    raw_logs: str,
+    http_status: int,
+    http_body: str,
+) -> dict:
+    """
+    Send raw server logs + HTTP response + all source files to Gemini (or Claude
+    fallback) and let the AI decide whether there are errors and how to fix them.
+
+    Returns one of:
+        {"status": "ok"}
+        {"status": "errors_found", "diagnosis": "...", "fixed_files": {"path": "content", ...}}
+        {"status": "error", "message": "..."}  (AI unavailable / parse failure)
+    """
+    from app.config import get_settings
+    api_key = get_settings().gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+
+    # Build file listing
+    file_listing = ""
+    for fp, content in source_files.items():
+        if fp.endswith((".jsx", ".tsx", ".css", ".js")):
+            file_listing += f"\n=== {fp} ===\n{content}\n"
+
+    prompt = (
+        "You are debugging a Next.js 14 app (App Router, Tailwind CSS v4, JSX components).\n\n"
+        f"## Server Logs (last 300 lines)\n```\n{raw_logs[-8000:]}\n```\n\n"
+        f"## HTTP Response (status {http_status})\n```\n{http_body[:3000]}\n```\n\n"
+        f"## Source Files\n{file_listing[:25000]}\n\n"
+        "## Task\n"
+        "1. Analyze the server logs and HTTP response for compilation errors, runtime errors, or blank pages.\n"
+        "2. If everything looks healthy (compiled successfully, page renders), return: {\"status\": \"ok\"}\n"
+        "3. If there are errors, diagnose the root cause and return fixed files.\n\n"
+        "## Response Format (JSON only, no markdown fences)\n"
+        "If OK: {\"status\": \"ok\"}\n"
+        "If errors found:\n"
+        "{\n"
+        "  \"status\": \"errors_found\",\n"
+        "  \"diagnosis\": \"Brief description of what's wrong\",\n"
+        "  \"fixed_files\": {\n"
+        "    \"app/page.jsx\": \"... complete corrected file content ...\",\n"
+        "    \"components/Hero.jsx\": \"... complete corrected file content ...\"\n"
+        "  }\n"
+        "}\n\n"
+        "## Rules\n"
+        "- Return COMPLETE file contents for every fixed file (not patches).\n"
+        "- Only include files that actually need changes.\n"
+        "- Use className (not class), htmlFor (not for), self-closing void elements.\n"
+        "- style must be an object: style={{ color: '#fff' }}\n"
+        "- HTML entities like &nbsp; must be replaced with actual characters.\n"
+        "- globals.css must start with @import \"tailwindcss\"; (v4, NOT @tailwind directives).\n"
+        "- Keep the file's logic and layout intact — only fix the errors.\n"
+        "- Output ONLY the JSON object. No explanation outside JSON.\n"
+    )
+
+    # Try Gemini first
+    if api_key:
+        def _call_gemini():
+            try:
+                from google import genai
+                client = genai.Client(api_key=api_key)
+                response = client.models.generate_content(
+                    model="gemini-2.5-pro",
+                    contents=prompt,
+                )
+                return response.text.strip()
+            except Exception as e:
+                print(f"  [diagnose] Gemini API failed: {e}")
+                return None
+
+        try:
+            raw_response = await asyncio.to_thread(_call_gemini)
+        except Exception as e:
+            print(f"  [diagnose] Gemini thread failed: {e}")
+            raw_response = None
+
+        if raw_response:
+            text = _strip_code_fences(raw_response)
+            try:
+                result = json.loads(text)
+                if result.get("status") in ("ok", "errors_found"):
+                    # Filter fixed_files to valid paths
+                    if result.get("fixed_files"):
+                        allowed_prefixes = ("app/", "components/", "lib/")
+                        result["fixed_files"] = {
+                            fp: content for fp, content in result["fixed_files"].items()
+                            if any(fp.startswith(p) for p in allowed_prefixes)
+                        }
+                    print(f"  [diagnose] Gemini result: {result.get('status')}"
+                          f"{' — ' + result.get('diagnosis', '')[:100] if result.get('diagnosis') else ''}")
+                    return result
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"  [diagnose] Gemini JSON parse failed: {e}")
+                print(f"  [diagnose] Raw response (first 300): {text[:300]}")
+
+    # Fallback to Claude
+    print("  [diagnose] Falling back to Claude...")
+    try:
+        client = _get_client()
+        text = ""
+        async with client.messages.stream(
+            model=CLAUDE_MODEL,
+            max_tokens=16000,
+            system=(
+                "You are a Next.js error diagnosis assistant. "
+                "Analyze server logs and source code, then return JSON. "
+                "No markdown fences. Only output valid JSON."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            async for chunk in stream.text_stream:
+                text += chunk
+
+        text = _strip_code_fences(text.strip())
+        result = json.loads(text)
+        if result.get("status") in ("ok", "errors_found"):
+            if result.get("fixed_files"):
+                allowed_prefixes = ("app/", "components/", "lib/")
+                result["fixed_files"] = {
+                    fp: content for fp, content in result["fixed_files"].items()
+                    if any(fp.startswith(p) for p in allowed_prefixes)
+                }
+            print(f"  [diagnose] Claude result: {result.get('status')}"
+                  f"{' — ' + result.get('diagnosis', '')[:100] if result.get('diagnosis') else ''}")
+            return result
+    except Exception as e:
+        print(f"  [diagnose] Claude fallback failed: {e}")
+
+    return {"status": "error", "message": "AI diagnosis unavailable"}
 
 
 # ---------------------------------------------------------------
@@ -997,346 +1106,114 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     await _restart_dev_server(sandbox_info["sandbox_id"], state["project_root"])
 
     # ============================================================
-    # [E] CHECK COMPILATION + FIX
+    # [E] CHECK COMPILATION + FIX (AI-driven)
     # ============================================================
-    _log("Polling for compilation (up to 60s)...")
-    yield sse_event("step", {"step": "checking", "message": "Waiting for compilation..."})
-    for _poll in range(20):  # up to 60s
-        await asyncio.sleep(3)
-        try:
-            poll_logs = await get_sandbox_logs(
-                sandbox_info["sandbox_id"], state["project_root"], lines=100,
-            )
-            poll_parsed = parse_nextjs_errors(poll_logs)
-            if poll_parsed["compiled"] or poll_parsed["has_errors"]:
-                _log(f"Compilation detected after {(_poll + 1) * 3}s "
-                     f"(compiled={poll_parsed['compiled']}, errors={poll_parsed['has_errors']})")
-                break
-        except Exception:
-            pass  # sandbox not ready yet, keep polling
-    else:
-        _log("Compilation not detected after 60s — proceeding to check anyway")
-
-    all_errors_seen = []   # Cumulative error tracking
-    prior_fixes = {}       # Track files modified in previous attempts
-    fix_iterations = 0     # Count actual fix attempts applied
-
+    # Strategy: wait for compilation → HTTP check → if bad, send
+    # raw logs to AI for diagnosis + fix → repeat (max 4 attempts).
+    fix_iterations = 0
     max_fix_attempts = 4
+
+    _log("Waiting 10s for initial compilation...")
+    yield sse_event("step", {"step": "checking", "message": "Waiting for compilation..."})
+    await asyncio.sleep(10)
+
     for attempt in range(max_fix_attempts):
         _log(f"Checking compilation (attempt {attempt + 1}/{max_fix_attempts})...")
 
-        # Step 1: Check server logs
+        # 1. Fast-path: HTTP check
+        http_result = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0)
+        _save_file_locally(state.get("clone_id"),
+                           f"_diagnostics/http_check_attempt{attempt+1}.txt",
+                           f"status={http_result['status_code']} ok={http_result['ok']}\n{http_result.get('body', '')[:2000]}")
+
+        if http_result["ok"]:
+            _log(f"Page verified OK (HTTP {http_result['status_code']}, "
+                 f"{http_result['body_length']} bytes)")
+            yield sse_event("compiled", {"message": "Compiled and verified successfully"})
+            break
+
+        # 2. Not OK — fetch raw server logs for diagnosis
+        _log(f"HTTP check failed (status={http_result['status_code']}, "
+             f"errors={http_result.get('errors', [])})")
+
         logs = ""
         try:
             logs = await get_sandbox_logs(
-                sandbox_info["sandbox_id"],
-                state["project_root"],
-                lines=200,
+                sandbox_info["sandbox_id"], state["project_root"], lines=300,
             )
         except Exception as log_err:
             _log(f"Failed to fetch logs: {log_err}")
-            yield sse_event("warning", {"message": f"Sandbox connection error: {log_err}"})
-            if attempt < max_fix_attempts - 1:
-                _log("Retrying in 10s...")
-                await asyncio.sleep(10)
-                continue
-            else:
-                yield sse_event("warning", {"message": "Could not verify compilation"})
-                break
 
         _save_file_locally(state.get("clone_id"),
                            f"_diagnostics/server_logs_attempt{attempt+1}.txt", logs)
-        parsed = parse_nextjs_errors(logs)
-        runtime = parse_runtime_errors(logs)
 
-        # Track compilation and runtime errors separately
-        compilation_errors = _filter_errors_to_generated(parsed["errors"], state["files"])
-        runtime_errors_list = _filter_errors_to_generated(runtime["errors"], state["files"])
+        # Last attempt — no more fixes, just warn
+        if attempt >= max_fix_attempts - 1:
+            _log("Max fix attempts reached — giving up")
+            yield sse_event("warning", {
+                "message": f"Could not fully resolve errors after {max_fix_attempts} attempts"
+            })
+            break
 
-        # Combined for internal fix logic
-        combined_errors = compilation_errors + runtime_errors_list
-        parsed["errors"] = combined_errors
-        has_errors = len(combined_errors) > 0 or parsed["has_errors"] or runtime["has_errors"]
+        # 3. Send everything to AI for diagnosis + fix
+        yield sse_event("step", {"step": "fixing", "message": f"AI diagnosing errors (attempt {attempt + 1})..."})
 
-        # Step 2: If compiled with no log errors, verify via HTTP
-        http_runtime_errors = []
-        if parsed["compiled"] and not has_errors:
-            _log("Server logs say compiled — verifying page renders...")
-            http_result = await _check_sandbox_http(sandbox_info["sandbox_id"])
+        diag = await _diagnose_and_fix(
+            source_files=state["files"],
+            raw_logs=logs,
+            http_status=http_result["status_code"],
+            http_body=http_result.get("body", ""),
+        )
 
-            if http_result["ok"]:
-                _log(f"Page verified OK (HTTP {http_result['status_code']}, "
-                     f"{http_result['body_length']} bytes)")
+        if diag.get("status") == "ok":
+            # AI says it's fine — recheck HTTP to confirm
+            _log("AI says OK — rechecking HTTP...")
+            recheck = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=2)
+            if recheck["ok"]:
+                _log("Confirmed OK on recheck")
                 yield sse_event("compiled", {"message": "Compiled and verified successfully"})
                 break
             else:
-                _log(f"Page has runtime errors: {http_result['errors']}")
-                extracted_msgs = http_result.get("error_messages", [])
-                body_snippet = http_result.get("body", "")[:500]
-                # Use extracted error messages if available, otherwise fall back to indicators
-                if extracted_msgs:
-                    for msg in extracted_msgs:
-                        http_runtime_errors.append({
-                            "type": "runtime_error",
-                            "file": "app/page.jsx",
-                            "line": None,
-                            "message": msg,
-                        })
-                else:
-                    for err_indicator in http_result["errors"]:
-                        http_runtime_errors.append({
-                            "type": "runtime_error",
-                            "file": "app/page.jsx",
-                            "line": None,
-                            "message": f"Runtime error on page: {err_indicator}\nPage HTML snippet: {body_snippet}",
-                        })
-                has_errors = True
-                combined_errors.extend(http_runtime_errors)
-
-        # If nothing detected yet (not compiled or inconclusive)
-        if not has_errors and not http_runtime_errors:
-            if attempt < max_fix_attempts - 1:
-                _log("Not compiled yet, polling up to 15s...")
-                for _wpoll in range(5):  # up to 15s
-                    await asyncio.sleep(3)
-                    try:
-                        wpoll_logs = await get_sandbox_logs(
-                            sandbox_info["sandbox_id"], state["project_root"], lines=100,
-                        )
-                        wpoll_parsed = parse_nextjs_errors(wpoll_logs)
-                        if wpoll_parsed["compiled"] or wpoll_parsed["has_errors"]:
-                            _log(f"Compilation detected after {(_wpoll + 1) * 3}s")
-                            break
-                    except Exception:
-                        pass
+                _log("AI said OK but HTTP still failing — retrying diagnosis")
                 continue
-            else:
-                _log("Logs inconclusive — trying HTTP check...")
-                http_result = await _check_sandbox_http(sandbox_info["sandbox_id"])
-                if http_result["ok"]:
-                    yield sse_event("compiled", {"message": "Server responding correctly"})
-                    break
-                else:
-                    # HTTP error on last attempt — feed it into the fix path
-                    # instead of just warning and giving up
-                    _log(f"HTTP check failed: {http_result['errors']}")
-                    extracted_msgs = http_result.get("error_messages", [])
-                    body_snippet = http_result.get("body", "")[:500]
-                    if extracted_msgs:
-                        for msg in extracted_msgs:
-                            combined_errors.append({
-                                "type": "runtime_error",
-                                "file": "app/page.jsx",
-                                "line": None,
-                                "message": msg,
-                            })
-                    else:
-                        for err_indicator in http_result["errors"]:
-                            combined_errors.append({
-                                "type": "runtime_error",
-                                "file": "app/page.jsx",
-                                "line": None,
-                                "message": f"Runtime error on page: {err_indicator}\nPage HTML snippet: {body_snippet}",
-                            })
-                    has_errors = True
 
-        # Emit separate events for compilation and runtime errors
-        if compilation_errors:
-            comp_report = format_nextjs_errors({**parsed, "errors": compilation_errors, "has_errors": True})
-            _log(f"Compilation errors ({len(compilation_errors)}): {comp_report[:200]}")
-            yield sse_event("compile_errors", {
-                "attempt": attempt + 1,
-                "error_count": len(compilation_errors),
-                "report": comp_report[:500],
-                "errors": [
-                    {"file": e.get("file"), "line": e.get("line"), "message": e.get("message", "")[:200]}
-                    for e in compilation_errors[:8]
-                ],
-            })
+        if diag.get("status") == "errors_found" and diag.get("fixed_files"):
+            fixed = diag["fixed_files"]
+            diagnosis = diag.get("diagnosis", "")
+            _log(f"AI diagnosis: {diagnosis[:150]}")
+            _log(f"AI fixed {len(fixed)} files: {list(fixed.keys())}")
 
-        all_runtime = runtime_errors_list + http_runtime_errors
-        if all_runtime:
-            _log(f"Runtime errors ({len(all_runtime)})")
-            yield sse_event("runtime_errors", {
-                "attempt": attempt + 1,
-                "error_count": len(all_runtime),
-                "errors": [
-                    {"file": e.get("file"), "line": e.get("line"), "message": e.get("message", "")[:200]}
-                    for e in all_runtime[:8]
-                ],
-            })
+            fix_iterations += 1
 
-        # Fallback: has_errors flag set but no individually parsed errors
-        if not compilation_errors and not all_runtime:
-            error_report = format_nextjs_errors(parsed)
-            _log(f"Errors detected: {error_report[:200]}")
-            yield sse_event("compile_errors", {
-                "attempt": attempt + 1,
-                "error_count": 0,
-                "report": error_report[:500],
-            })
+            # Update state and emit events
+            for fp, content in fixed.items():
+                files[fp] = content
+                state["files"][fp] = content
+                yield sse_event("file_updated", {"path": fp, "content": content})
+                _save_file_locally(state.get("clone_id"), fp, content)
 
-        # If we only have HTTP runtime errors (no log-parsed errors),
-        # fetch fresh logs — the dev server often logs the actual stack trace
-        if http_runtime_errors and not compilation_errors and not runtime_errors_list:
-            try:
-                fresh_logs = await get_sandbox_logs(
-                    sandbox_info["sandbox_id"], state["project_root"], lines=200
-                )
-                fresh_parsed = parse_nextjs_errors(fresh_logs)
-                fresh_runtime = parse_runtime_errors(fresh_logs)
-                fresh_errors = _filter_errors_to_generated(
-                    fresh_parsed["errors"] + fresh_runtime["errors"], state["files"]
-                )
-                if fresh_errors:
-                    _log(f"Fresh logs revealed {len(fresh_errors)} additional errors")
-                    combined_errors.extend(fresh_errors)
-            except Exception:
-                pass
+            # Upload fixes to sandbox
+            await _clear_sandbox_logs(sandbox_info["sandbox_id"], state["project_root"])
+            await upload_files_to_sandbox(
+                sandbox_info["sandbox_id"],
+                fixed,
+                project_root=state["project_root"],
+            )
+            await _touch_sandbox_files(
+                sandbox_info["sandbox_id"],
+                list(fixed.keys()),
+                state["project_root"],
+            )
 
-        if attempt < max_fix_attempts - 1:
-            # Handle missing module imports
-            missing_fixed = {}
-            remaining_errors = []
-            for err in combined_errors:
-                if err.get("type") == "module_not_found" and err.get("module"):
-                    mod = err["module"]
-                    comp_path = mod.lstrip("./").lstrip("../")
-                    if comp_path.startswith("components/") and f"{comp_path}.jsx" not in files:
-                        comp_name = comp_path.split("/")[-1]
-                        _log(f"Missing component '{comp_name}' — removing from page.jsx")
-                        page = files.get("app/page.jsx", "")
-                        page = re.sub(
-                            rf'import\s+{re.escape(comp_name)}\s+from\s+"[^"]*";\n?',
-                            "", page
-                        )
-                        page = re.sub(
-                            rf'^\s*<ErrorBoundary[^>]*><{re.escape(comp_name)}\s*/><\/ErrorBoundary>\n?',
-                            "", page, flags=re.MULTILINE
-                        )
-                        page = re.sub(
-                            rf'^\s*<{re.escape(comp_name)}\s*/>\n?',
-                            "", page, flags=re.MULTILINE
-                        )
-                        missing_fixed["app/page.jsx"] = page
-                        continue
-                remaining_errors.append(err)
+            yield sse_event("step", {"step": "verifying", "message": f"Verifying fix (attempt {fix_iterations})..."})
+            _log("Waiting 10s for recompilation after fix...")
+            await asyncio.sleep(10)
+            continue
 
-            if missing_fixed:
-                files.update(missing_fixed)
-                state["files"].update(missing_fixed)
-                for fp, content in missing_fixed.items():
-                    yield sse_event("file_updated", {"path": fp, "content": content})
-
-            # Fix remaining errors — try Gemini first, fall back to Claude
-            fixed = {}
-            if remaining_errors:
-                # Group errors by file for Gemini (per-file fixer)
-                errors_by_file: dict[str, list] = {}
-                for err in remaining_errors:
-                    fp = err.get("file") or "app/page.jsx"
-                    errors_by_file.setdefault(fp, []).append(err)
-
-                # Try Gemini for each file with errors
-                gemini_fixed = {}
-                for fp, file_errors in errors_by_file.items():
-                    src = state["files"].get(fp)
-                    if not src:
-                        # Try suffix match
-                        src_key = next((k for k in state["files"] if k.endswith(fp) or fp.endswith(k)), None)
-                        if src_key:
-                            src = state["files"][src_key]
-                            fp = src_key
-                    if not src:
-                        continue
-                    gemini_result = await _fix_with_gemini(src, fp, file_errors)
-                    if gemini_result and gemini_result != src:
-                        gemini_fixed[fp] = gemini_result
-
-                if gemini_fixed:
-                    _log(f"Gemini fixed {len(gemini_fixed)} files: {list(gemini_fixed.keys())}")
-                    fixed.update(gemini_fixed)
-                    yield sse_event("step", {"step": "fixing", "message": f"Gemini fixed {len(gemini_fixed)} file(s)"})
-
-                # Fall back to Claude for any files Gemini didn't fix
-                unfixed_errors = [
-                    err for err in remaining_errors
-                    if (err.get("file") or "app/page.jsx") not in gemini_fixed
-                ]
-                if unfixed_errors:
-                    _log(f"Falling back to Claude for {len(unfixed_errors)} remaining errors")
-                    prior_context = ""
-                    if prior_fixes:
-                        prior_context = (
-                            "\nPrevious fix attempts did NOT resolve these errors. "
-                            "Files already modified:\n"
-                        )
-                        for fp in prior_fixes:
-                            prior_context += f"  - {fp}\n"
-                        if all_errors_seen:
-                            prior_context += "Errors that persisted:\n"
-                            for prev_err in all_errors_seen[-5:]:
-                                prior_context += f"  - {prev_err.get('message', '')[:150]}\n"
-                        prior_context += "Try a DIFFERENT approach this time.\n"
-
-                    try:
-                        claude_fixed = await fix_targeted(
-                            state["files"], unfixed_errors, "compilation/runtime",
-                            prior_context=prior_context,
-                            all_files=state["files"] if http_runtime_errors else None,
-                        )
-                        if claude_fixed:
-                            _log(f"Claude fixed {len(claude_fixed)} files: {list(claude_fixed.keys())}")
-                            fixed.update(claude_fixed)
-                    except Exception as fix_err:
-                        _log(f"Claude fix agent failed: {fix_err}")
-                        if not fixed:
-                            break
-
-            # Merge all fixes
-            fixed.update(missing_fixed)
-            all_errors_seen.extend(remaining_errors)
-            prior_fixes.update(fixed)
-
-            if fixed:
-                fix_iterations += 1
-                for fp, content in fixed.items():
-                    files[fp] = content
-                    state["files"][fp] = content
-                    yield sse_event("file_updated", {"path": fp, "content": content})
-
-                await _clear_sandbox_logs(sandbox_info["sandbox_id"], state["project_root"])
-                await upload_files_to_sandbox(
-                    sandbox_info["sandbox_id"],
-                    fixed,
-                    project_root=state["project_root"],
-                )
-                await _touch_sandbox_files(
-                    sandbox_info["sandbox_id"],
-                    list(fixed.keys()),
-                    state["project_root"],
-                )
-
-                yield sse_event("step", {"step": "verifying", "message": f"Verifying fix (attempt {fix_iterations})..."})
-                _log(f"Fixed {len(fixed)} files, polling for recompilation...")
-                # Smart polling instead of blind sleep
-                for _rpoll in range(15):  # up to 45s
-                    await asyncio.sleep(3)
-                    try:
-                        rpoll_logs = await get_sandbox_logs(
-                            sandbox_info["sandbox_id"], state["project_root"], lines=100,
-                        )
-                        rpoll_parsed = parse_nextjs_errors(rpoll_logs)
-                        if rpoll_parsed["compiled"] or rpoll_parsed["has_errors"]:
-                            _log(f"Recompilation detected after {(_rpoll + 1) * 3}s")
-                            break
-                    except Exception:
-                        pass
-                else:
-                    _log("Recompilation not detected after 45s — proceeding")
-            else:
-                _log("No fixes applied")
-                break
+        # AI failed or returned unexpected status
+        _log(f"AI diagnosis inconclusive: {diag}")
+        yield sse_event("warning", {"message": "Could not diagnose errors automatically"})
+        break
 
     # ============================================================
     # [F] DONE
@@ -1395,73 +1272,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
 
 # ---------------------------------------------------------------
-# GEMINI FIX — fast error fixer using Gemini Flash
-# ---------------------------------------------------------------
-
-async def _fix_with_gemini(file_content: str, filepath: str, errors: list[dict]) -> str | None:
-    """
-    Send a broken file + its errors to Gemini Flash and get a corrected version.
-
-    Returns the fixed file content, or None if Gemini is unavailable or fails.
-    """
-    from app.config import get_settings
-    api_key = get_settings().gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        print("  [gemini-fix] No GEMINI_API_KEY — skipping")
-        return None
-
-    error_text = "\n".join(
-        f"- Line {e.get('line', '?')}: {e.get('message', 'unknown error')}"
-        for e in errors
-    )
-
-    prompt = (
-        f"Fix this Next.js/React JSX file. It has the following compilation/runtime errors:\n\n"
-        f"{error_text}\n\n"
-        f"File: {filepath}\n"
-        f"```\n{file_content}\n```\n\n"
-        "RULES:\n"
-        "- Return ONLY the complete corrected file content, nothing else.\n"
-        "- No markdown fences, no explanation.\n"
-        "- Use className (not class), htmlFor (not for), self-closing void elements.\n"
-        "- style must be an object: style={{ color: '#fff' }}\n"
-        "- HTML entities like &nbsp; must be replaced with actual characters or {' '}.\n"
-        "- This project uses Tailwind CSS v4: globals.css starts with @import \"tailwindcss\";\n"
-        "- Do NOT use @tailwind directives (that is v3 and will break).\n"
-        "- Keep the file's logic and layout intact — only fix the errors.\n"
-    )
-
-    def _call_gemini():
-        try:
-            from google import genai
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=prompt,
-            )
-            text = response.text.strip()
-            # Strip markdown fences if Gemini wraps them
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-            if text.endswith("```"):
-                text = text[:-3].rstrip()
-            return text if len(text) > 20 else None
-        except Exception as e:
-            print(f"  [gemini-fix] API call failed: {e}")
-            return None
-
-    try:
-        result = await asyncio.to_thread(_call_gemini)
-        if result:
-            print(f"  [gemini-fix] Got fix for {filepath} ({len(result)} chars)")
-        return result
-    except Exception as e:
-        print(f"  [gemini-fix] Thread failed: {e}")
-        return None
-
-
-# ---------------------------------------------------------------
-# TARGETED FIX — shared by compilation fix path
+# TARGETED FIX — used by chat follow-up flow
 # ---------------------------------------------------------------
 
 async def fix_targeted(
