@@ -124,6 +124,8 @@ async def _restart_dev_server(sandbox_id: str, project_root: str):
             sb.process.exec("pkill -f next || true; pkill -f bun || true", timeout=15)
             import time as _t
             _t.sleep(2)
+            # Clear .next build cache — stale artifacts cause ghost 404s after file swap
+            sb.process.exec(f"rm -rf {project_root}/.next", timeout=15)
             # Clear old logs
             log_file = f"{project_root}/server.log"
             sb.process.exec(f"> {log_file}", timeout=10)
@@ -768,7 +770,7 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
             raw = ""
             async with client.messages.stream(
                 model=CLAUDE_MODEL,
-                max_tokens=32000,
+                max_tokens=64000,
                 system=[{
                     "type": "text",
                     "text": GENERATE_SYSTEM_PROMPT,
@@ -845,6 +847,40 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
     if "app/globals.css" not in files:
         print("  [generate] WARNING: No globals.css generated — creating minimal")
         files["app/globals.css"] = '@import "tailwindcss";\n\n@layer base {\n  html { scroll-behavior: smooth; }\n  body { -webkit-font-smoothing: antialiased; }\n}\n'
+
+    # 4. Ensure page.jsx exists — without it Next.js returns 404 on /
+    has_page = any(k in files for k in ("app/page.jsx", "app/page.tsx"))
+    if not has_page:
+        print("  [generate] CRITICAL: No page.jsx generated (likely truncated) — creating fallback")
+        # Build a fallback page that imports whatever components were generated
+        component_files = [fp for fp in files if fp.startswith("components/") and fp.endswith((".jsx", ".tsx"))]
+        imports = []
+        renders = []
+        for cf in component_files:
+            name = os.path.splitext(os.path.basename(cf))[0]
+            imports.append(f'import {name} from "../{cf.rsplit(".", 1)[0]}";')
+            renders.append(f"      <{name} />")
+
+        if imports:
+            fallback = (
+                '"use client";\n\n'
+                + "\n".join(imports) + "\n\n"
+                "export default function Home() {\n"
+                "  return (\n"
+                "    <main>\n"
+                + "\n".join(renders) + "\n"
+                "    </main>\n"
+                "  );\n"
+                "}\n"
+            )
+        else:
+            fallback = (
+                '"use client";\n\n'
+                "export default function Home() {\n"
+                '  return <main className="min-h-screen"><p>Loading...</p></main>;\n'
+                "}\n"
+            )
+        files["app/page.jsx"] = fallback
 
     # 4. Sanitize JSX — fix HTML-isms that cause "Parsing ecmascript source code failed"
     for fp in list(files.keys()):
