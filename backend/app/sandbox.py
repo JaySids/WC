@@ -213,16 +213,43 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                     sandbox,
                     f"{BUN_BIN} create next-app@latest {PROJECT_PATH} "
                     f"--typescript --tailwind --eslint --app --use-bun --yes",
-                    timeout=90,
+                    timeout=120,
                 )
+
+                # Verify that scaffolding actually installed deps — bun create
+                # can scaffold files but fail/timeout on the install step.
+                check = sandbox.process.exec(
+                    f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
+                    timeout=10,
+                )
+                if "MISSING" in (check.result or ""):
+                    _notify("Dependencies missing after scaffold — running bun install...")
+                    _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
+
+                    # Verify again
+                    check2 = sandbox.process.exec(
+                        f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
+                        timeout=10,
+                    )
+                    if "MISSING" in (check2.result or ""):
+                        raise RuntimeError("next binary still missing after explicit bun install")
 
                 # Install extra packages in one shot
                 _notify("Installing extra packages...")
                 _exec(
                     sandbox,
                     f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
-                    timeout=90,
+                    timeout=120,
                 )
+
+                # Final verification — bun add can sometimes nuke node_modules
+                check3 = sandbox.process.exec(
+                    f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
+                    timeout=10,
+                )
+                if "MISSING" in (check3.result or ""):
+                    _notify("Dependencies broken after bun add — reinstalling...")
+                    _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
 
                 # Upload ErrorBoundary component
                 sandbox.process.exec(f"mkdir -p {PROJECT_PATH}/components", timeout=5)
@@ -375,6 +402,15 @@ async def start_sandbox(sandbox_id: str) -> dict:
             sandbox.set_auto_archive_interval(7 * 24 * 60)
         except Exception:
             pass
+
+        # Verify next binary exists before trying to start
+        check_next = sandbox.process.exec(
+            f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
+            timeout=10,
+        )
+        if "MISSING" in (check_next.result or ""):
+            print(f"[start_sandbox] next binary missing — running bun install...")
+            sandbox.process.exec(f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
 
         # Restart dev server
         sandbox.process.exec("pkill -f next || true; pkill -f bun || true")

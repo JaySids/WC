@@ -107,6 +107,19 @@ async def _restart_dev_server(sandbox_id: str, project_root: str):
         try:
             daytona = get_daytona_client()
             sb = daytona.get(sandbox_id)
+
+            # Verify next binary exists before trying to start it
+            check_next = sb.process.exec(
+                f"test -f {project_root}/node_modules/.bin/next && echo OK || echo MISSING",
+                timeout=10,
+            )
+            if "MISSING" in (check_next.result or ""):
+                print("  [restart-dev] next binary missing — running bun install...")
+                sb.process.exec(
+                    f"{BUN_BIN} install --cwd {project_root}",
+                    timeout=120,
+                )
+
             # Kill existing dev server
             sb.process.exec("pkill -f next || true; pkill -f bun || true", timeout=15)
             import time as _t
@@ -125,6 +138,9 @@ async def _restart_dev_server(sandbox_id: str, project_root: str):
             check = sb.process.exec("pgrep -f 'next dev' || echo 'NOT_RUNNING'", timeout=10)
             if check.result and "NOT_RUNNING" in check.result:
                 print("  [restart-dev] WARNING: dev server process not found after start")
+                # Check logs for the error
+                log_check = sb.process.exec(f"tail -5 {log_file} 2>/dev/null", timeout=10)
+                print(f"  [restart-dev] Server log: {(log_check.result or '').strip()}")
                 # Try one more time
                 sb.process.exec(start_cmd, timeout=15)
                 _t.sleep(2)
