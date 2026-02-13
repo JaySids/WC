@@ -208,6 +208,17 @@ async def provision_react_sandbox_from_template() -> dict:
         )
         sandbox = daytona.create(params, timeout=120)
 
+        # Wait for sandbox to be fully ready before executing commands
+        for _ready_attempt in range(15):
+            try:
+                probe = sandbox.process.exec("echo ready", timeout=10)
+                if probe.result and "ready" in probe.result:
+                    break
+            except Exception:
+                pass
+            import time as _t2
+            _t2.sleep(2)
+
         # Belt-and-suspenders: explicitly set intervals
         try:
             sandbox.set_autostop_interval(0)

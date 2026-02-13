@@ -143,15 +143,21 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         if progress:
             progress.put(msg)
 
-    def _exec(sandbox, cmd, timeout=60, retries=2):
-        """Run a command with retry on timeout."""
+    def _exec(sandbox, cmd, timeout=60, retries=3):
+        """Run a command with retry on transient errors."""
         for attempt in range(retries):
             try:
                 return sandbox.process.exec(cmd, timeout=timeout)
             except Exception as e:
-                if attempt < retries - 1 and "timeout" in str(e).lower():
-                    _notify(f"  Command timed out, retrying ({attempt + 1}/{retries})...")
-                    time.sleep(2)
+                err_msg = str(e).lower()
+                is_transient = any(kw in err_msg for kw in (
+                    "timeout", "connection", "unavailable", "not running",
+                    "not ready", "refused", "reset", "broken pipe", "eof",
+                ))
+                if attempt < retries - 1 and is_transient:
+                    wait = 3 * (attempt + 1)
+                    _notify(f"  Command failed ({e}), retrying in {wait}s ({attempt + 1}/{retries})...")
+                    time.sleep(wait)
                 else:
                     raise
 
@@ -166,6 +172,22 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
             auto_archive_interval=7 * 24 * 60,  # 7 days in minutes
         )
         sandbox = daytona.create(params, timeout=120)
+
+        # Wait for sandbox to be fully ready before executing commands.
+        # daytona.create() returns once the sandbox object exists, but the
+        # underlying container may still be starting up.  Without this
+        # readiness gate the very first process.exec() can fail with
+        # connection-refused / "not running" errors — which is why
+        # "reactivating" (daytona.start) works but fresh creates crash.
+        _notify("Waiting for sandbox to be ready...")
+        for _ready_attempt in range(15):          # up to ~30s
+            try:
+                probe = sandbox.process.exec("echo ready", timeout=10)
+                if probe.result and "ready" in probe.result:
+                    break
+            except Exception:
+                pass
+            time.sleep(2)
 
         try:
             sandbox.set_autostop_interval(SANDBOX_TTL_MINUTES)
