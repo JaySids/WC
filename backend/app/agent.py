@@ -224,10 +224,30 @@ Output ONLY a JSON object mapping file paths to their complete file contents:
 No markdown fences around the JSON. No explanation. ONLY the JSON object.
 
 ## Required Files
-1. `app/globals.css` — Tailwind v4 CSS (see CSS Rules below)
-2. `app/layout.jsx` — Root layout with <html>, <head> with Google Font <link> tags, metadata export, body with font className. Must NOT have "use client".
+1. `app/globals.css` — Tailwind v4 CSS (see CSS Rules below). MUST start with `@import "tailwindcss";` as the VERY FIRST LINE.
+2. `app/layout.jsx` — MUST have `import "./globals.css";` as the FIRST import (THIS IS CRITICAL — without it NO CSS loads and the page is unstyled). Root layout with <html>, <head> with Google Font <link> tags, metadata export, body with font className. Must NOT have "use client".
 3. `app/page.jsx` — "use client" directive, imports and renders ALL section components in visual order top-to-bottom
 4. `components/*.jsx` — One file per major page section (Navbar, Hero, Features, Pricing, Testimonials, FAQ, Footer, etc.)
+
+## layout.jsx Template (FOLLOW THIS EXACTLY)
+```jsx
+import "./globals.css";
+
+export const metadata = { title: "...", description: "..." };
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        {/* Google Font <link> tags here */}
+      </head>
+      <body className="font-sans">{children}</body>
+    </html>
+  );
+}
+```
 
 ## FAITHFUL REPLICATION RULES (MOST IMPORTANT)
 - Clone the website EXACTLY as it appears in the screenshots and scraped data
@@ -555,6 +575,39 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
         fp: content for fp, content in files.items()
         if any(fp.startswith(p) for p in valid_prefixes)
     }
+
+    # ── Post-generation safety checks ──────────────────────────────────────
+    # 1. Ensure layout.jsx imports globals.css (without it → zero CSS)
+    layout_key = next((k for k in files if k in ("app/layout.jsx", "app/layout.tsx")), None)
+    if layout_key and 'import "./globals.css"' not in files[layout_key] and "import './globals.css'" not in files[layout_key]:
+        print("  [generate] WARNING: layout missing globals.css import — injecting")
+        content = files[layout_key]
+        # Insert after "use client" if present, otherwise at top
+        if content.strip().startswith('"use client"') or content.strip().startswith("'use client'"):
+            lines = content.split("\n", 1)
+            files[layout_key] = lines[0] + '\nimport "./globals.css";\n' + (lines[1] if len(lines) > 1 else "")
+        else:
+            files[layout_key] = 'import "./globals.css";\n' + content
+
+    # 2. Ensure globals.css starts with @import "tailwindcss" (without it → no Tailwind)
+    css_key = next((k for k in files if k in ("app/globals.css",)), None)
+    if css_key:
+        css = files[css_key]
+        if '@import "tailwindcss"' not in css and "@import 'tailwindcss'" not in css:
+            if "@tailwind base" in css:
+                # Claude used v3 syntax — replace with v4
+                print("  [generate] WARNING: globals.css uses Tailwind v3 syntax — converting to v4")
+                css = css.replace("@tailwind base;\n@tailwind components;\n@tailwind utilities;", '@import "tailwindcss";')
+                css = css.replace("@tailwind base;\n@tailwind components;\n@tailwind utilities", '@import "tailwindcss";')
+                files[css_key] = css
+            else:
+                print("  [generate] WARNING: globals.css missing @import tailwindcss — injecting")
+                files[css_key] = '@import "tailwindcss";\n\n' + css
+
+    # 3. Ensure globals.css exists at all
+    if "app/globals.css" not in files:
+        print("  [generate] WARNING: No globals.css generated — creating minimal")
+        files["app/globals.css"] = '@import "tailwindcss";\n\n@layer base {\n  html { scroll-behavior: smooth; }\n  body { -webkit-font-smoothing: antialiased; }\n}\n'
 
     print(f"  [generate] Generated {len(files)} files: {list(files.keys())}")
     return files, tokens_in, tokens_out
