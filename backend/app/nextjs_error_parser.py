@@ -87,6 +87,47 @@ def parse_nextjs_errors(log_output: str) -> dict:
                 "message": msg[:300],
             })
 
+    # --- SWC / Turbopack "Parsing ecmascript source code failed" ---
+    # Format:  ⨯ ./app/page.jsx
+    #          Parsing ecmascript source code failed
+    #          ╭─[/home/daytona/my-app/app/page.jsx:25:1]
+    #          │  Expected '>' but found 'class'
+    for m in re.finditer(
+        r"Parsing ecmascript source code failed",
+        log_output,
+    ):
+        # Look in a window around the match for file path + line + hint
+        window = log_output[max(0, m.start() - 300):m.start() + 600]
+        file = None
+        line = None
+        hint = ""
+
+        # File path from ⨯ ./path or ╭─[/abs/path:line:col]
+        file_m = re.search(r"[⨯×]\s*(\./[\w/.-]+\.(?:tsx?|jsx?|css))", window)
+        if file_m:
+            file = _extract_project_path(file_m.group(1))
+        bracket_m = re.search(r"[╭├]─\[([^\]:]+):(\d+):\d+\]", window)
+        if bracket_m:
+            file = file or _extract_project_path(bracket_m.group(1))
+            line = int(bracket_m.group(2))
+
+        # Hint like "Expected '>' but found 'class'"
+        hint_m = re.search(r"(Expected\s+[^\n]+)", window)
+        if hint_m:
+            hint = hint_m.group(1).strip()
+
+        msg = "Parsing ecmascript source code failed"
+        if hint:
+            msg += f": {hint}"
+
+        errors.append({
+            "type": "syntax_error",
+            "file": file,
+            "line": line,
+            "message": msg[:300],
+            "fix_hint": "Check for HTML attributes in JSX — use className instead of class, htmlFor instead of for, self-close void elements (<img />, <br />), and use style={{}} objects not style strings.",
+        })
+
     # --- SyntaxError ---
     for m in re.finditer(
         r"SyntaxError:\s*([^\n]+?)(?:\s*\((\d+):(\d+)\))?",
@@ -164,7 +205,11 @@ def parse_nextjs_errors(log_output: str) -> dict:
             seen.add(key)
             unique_errors.append(e)
 
-    has_errors = len(unique_errors) > 0 or "Failed to compile" in log_output
+    has_errors = (
+        len(unique_errors) > 0
+        or "Failed to compile" in log_output
+        or "Parsing ecmascript source code failed" in log_output
+    )
 
     return {
         "has_errors": has_errors,

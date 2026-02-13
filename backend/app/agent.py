@@ -290,17 +290,41 @@ Example `app/globals.css`:
 }
 ```
 
-## JSX Rules (CRITICAL — violations cause compilation errors)
-- `className` not `class`
-- Self-close void elements: `<img />`, `<br />`, `<input />`
-- `style={{ color: '#fff' }}` not `style="color: #fff"`
-- `{/* comment */}` not `<!-- comment -->`
-- `htmlFor` not `for`
-- Every `.map()` needs a unique `key` prop
-- Every `<img>` needs an `alt` prop
-- `"use client"` at top of every component that uses hooks, events, or browser APIs
+## JSX Rules (CRITICAL — violations cause "Parsing ecmascript source code failed" and crash the build)
+Any HTML-style syntax in JSX will CRASH the build with "Parsing ecmascript source code failed". You MUST convert ALL HTML to valid JSX:
+
+### HTML → JSX conversions (EVERY ONE IS MANDATORY):
+| WRONG (crashes build)          | CORRECT                              |
+|-------------------------------|--------------------------------------|
+| `<div class="foo">`           | `<div className="foo">`              |
+| `<label for="x">`            | `<label htmlFor="x">`                |
+| `<img src="x">`              | `<img src="x" alt="" />`             |
+| `<br>`                        | `<br />`                             |
+| `<hr>`                        | `<hr />`                             |
+| `<input type="text">`        | `<input type="text" />`              |
+| `style="color: red"`         | `style={{ color: 'red' }}`           |
+| `<!-- comment -->`            | `{/* comment */}`                    |
+| `onclick="fn()"`             | `onClick={fn}`                       |
+| `tabindex="0"`               | `tabIndex={0}`                       |
+| `colspan="2"`                | `colSpan={2}`                        |
+| `&nbsp;`                     | `{'\u00A0'}` or just use a space     |
+| `&mdash;`                    | `—` (use the actual character)       |
+| `&amp;`                      | `&` (ampersands are fine in JSX text)|
+| `&lt;` / `&gt;`             | Use the actual `<` `>` chars in text, or `{'<'}` `{'>'}` |
+
+### Other required JSX rules:
+- `"use client"` at the TOP of every component file that uses hooks, events, or browser APIs
 - `app/layout.jsx` must NOT have "use client"
+- Every `.map()` needs a unique `key` prop
 - Export default function from every component file
+
+### PRE-OUTPUT CHECKLIST — verify before outputting ANY JSX:
+1. Search your output for the word `class=` — if found, replace with `className=`
+2. Search for `for=` on labels — if found, replace with `htmlFor=`
+3. Search for `style="` — if found, convert to `style={{ }}`
+4. Search for `<!--` — if found, convert to `{/* */}`
+5. Search for `<br>`, `<hr>`, `<img `, `<input ` without self-closing `/>` — add `/>`
+6. Search for `&nbsp;`, `&mdash;`, `&amp;`, `&quot;` — replace with actual characters
 
 ## Color Rules
 NEVER use named Tailwind colors (bg-blue-500, text-gray-600).
@@ -611,6 +635,53 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
         print("  [generate] WARNING: No globals.css generated — creating minimal")
         files["app/globals.css"] = '@import "tailwindcss";\n\n@layer base {\n  html { scroll-behavior: smooth; }\n  body { -webkit-font-smoothing: antialiased; }\n}\n'
 
+    # 4. Sanitize JSX — fix HTML-isms that cause "Parsing ecmascript source code failed"
+    for fp in list(files.keys()):
+        if not fp.endswith((".jsx", ".tsx")):
+            continue
+        src = files[fp]
+        original = src
+
+        # class= → className=  (but not className= which is already correct)
+        src = re.sub(r'\bclass=(["\'{])', r'className=\1', src)
+
+        # for= on labels → htmlFor=  (but not htmlFor= already)
+        src = re.sub(r'\bfor=(["\'{}])', r'htmlFor=\1', src)
+
+        # HTML comments → JSX comments
+        src = re.sub(r'<!--\s*(.*?)\s*-->', r'{/* \1 */}', src)
+
+        # Void elements without self-closing slash
+        src = re.sub(r'<(br|hr|img|input|meta|link|source|area|col|embed|wbr)(\s[^>]*)?\s*(?<!/)>',
+                     lambda m: f'<{m.group(1)}{m.group(2) or ""} />', src)
+
+        # HTML entities → actual characters
+        src = src.replace('&nbsp;', ' ')
+        src = src.replace('&mdash;', '\u2014')
+        src = src.replace('&ndash;', '\u2013')
+        src = src.replace('&laquo;', '\u00AB')
+        src = src.replace('&raquo;', '\u00BB')
+        src = src.replace('&bull;', '\u2022')
+        src = src.replace('&hellip;', '\u2026')
+        src = src.replace('&copy;', '\u00A9')
+        src = src.replace('&reg;', '\u00AE')
+        src = src.replace('&trade;', '\u2122')
+        # &amp; &lt; &gt; &quot; are trickier — only replace in text contexts,
+        # not inside JSX expressions.  Simple heuristic: skip them to be safe.
+
+        if src != original:
+            files[fp] = src
+            fixes_applied = []
+            if 'class=' in original and 'class=' not in src:
+                fixes_applied.append('class→className')
+            if re.search(r'\bfor=["\']', original):
+                fixes_applied.append('for→htmlFor')
+            if '<!--' in original:
+                fixes_applied.append('HTML comments→JSX')
+            if '&nbsp;' in original or '&mdash;' in original:
+                fixes_applied.append('HTML entities→chars')
+            print(f"  [generate] JSX sanitized {fp}: {', '.join(fixes_applied) or 'void elements'}")
+
     print(f"  [generate] Generated {len(files)} files: {list(files.keys())}")
     return files, tokens_in, tokens_out
 
@@ -902,9 +973,11 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
     all_errors_seen = []   # Cumulative error tracking
     prior_fixes = {}       # Track files modified in previous attempts
+    fix_iterations = 0     # Count actual fix attempts applied
 
-    for attempt in range(3):
-        _log(f"Checking compilation (attempt {attempt + 1}/3)...")
+    max_fix_attempts = 4
+    for attempt in range(max_fix_attempts):
+        _log(f"Checking compilation (attempt {attempt + 1}/{max_fix_attempts})...")
 
         # Step 1: Check server logs
         logs = ""
@@ -917,7 +990,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         except Exception as log_err:
             _log(f"Failed to fetch logs: {log_err}")
             yield sse_event("warning", {"message": f"Sandbox connection error: {log_err}"})
-            if attempt < 2:
+            if attempt < max_fix_attempts - 1:
                 _log("Retrying in 10s...")
                 await asyncio.sleep(10)
                 continue
@@ -965,7 +1038,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
         # If nothing detected yet (not compiled or inconclusive)
         if not has_errors and not http_runtime_errors:
-            if attempt < 2:
+            if attempt < max_fix_attempts - 1:
                 _log("Not compiled yet, waiting 15s...")
                 await asyncio.sleep(15)
                 continue
@@ -974,11 +1047,20 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                 http_result = await _check_sandbox_http(sandbox_info["sandbox_id"])
                 if http_result["ok"]:
                     yield sse_event("compiled", {"message": "Server responding correctly"})
+                    break
                 else:
-                    yield sse_event("warning", {
-                        "message": f"Page has errors: {http_result['errors']}"
-                    })
-                break
+                    # HTTP error on last attempt — feed it into the fix path
+                    # instead of just warning and giving up
+                    _log(f"HTTP check failed: {http_result['errors']}")
+                    body_snippet = http_result.get("body", "")[:500]
+                    for err_indicator in http_result["errors"]:
+                        combined_errors.append({
+                            "type": "runtime_error",
+                            "file": "app/page.jsx",
+                            "line": None,
+                            "message": f"Runtime error on page: {err_indicator}\nPage HTML snippet: {body_snippet}",
+                        })
+                    has_errors = True
 
         # Emit separate events for compilation and runtime errors
         if compilation_errors:
@@ -1034,7 +1116,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
             except Exception:
                 pass
 
-        if attempt < 2:
+        if attempt < max_fix_attempts - 1:
             # Handle missing module imports
             missing_fixed = {}
             remaining_errors = []
@@ -1101,6 +1183,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
             prior_fixes.update(fixed)
 
             if fixed:
+                fix_iterations += 1
                 for fp, content in fixed.items():
                     files[fp] = content
                     state["files"][fp] = content
@@ -1118,7 +1201,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                     state["project_root"],
                 )
 
-                yield sse_event("step", {"step": "verifying", "message": "Verifying fix..."})
+                yield sse_event("step", {"step": "verifying", "message": f"Verifying fix (attempt {fix_iterations})..."})
                 _log(f"Fixed {len(fixed)} files, waiting 15s for recompilation...")
                 await asyncio.sleep(15)
             else:
@@ -1137,6 +1220,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     _log(f"  Total: {total_time}s")
     _log(f"  Preview: {state.get('preview_url', 'NONE')}")
     _log(f"  Files: {len(file_list)}")
+    _log(f"  Fix iterations: {fix_iterations}")
     _log(f"  Tokens: {tokens_total_in} in / {tokens_total_out} out in {gen_time}s")
 
     yield sse_event("done", {
@@ -1144,6 +1228,7 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         "sandbox_id": state.get("sandbox_id"),
         "clone_id": state.get("clone_id"),
         "files": file_list,
+        "iterations": fix_iterations + 1,  # +1 for the initial generation
         "time": total_time,
     })
 
@@ -1250,6 +1335,15 @@ async def fix_targeted(
                 "IMPORTANT: This project uses Tailwind CSS v4. "
                 "app/globals.css MUST start with `@import \"tailwindcss\";` (NOT @tailwind base/components/utilities). "
                 "Use `@theme { }` for custom variables and `@layer base { }` for base styles. "
+                "\n"
+                "COMMON CAUSE of 'Parsing ecmascript source code failed': HTML syntax in JSX. "
+                "Fix ALL of these: class= → className=, for= → htmlFor=, "
+                "style=\"...\" → style={{ }}, <!-- --> → {/* */}, "
+                "<br>/<hr>/<img>/<input> → <br />/<hr />/<img />/<input />, "
+                "&nbsp; → {' '} or actual space, &mdash; → —, &amp; → &, "
+                "onclick → onClick, tabindex → tabIndex, colspan → colSpan. "
+                "Scan the ENTIRE file for these patterns, not just the reported error line. "
+                "\n"
                 "Output ONLY JSON: {\"filepath\": \"corrected content\"}. "
                 "No markdown fences around the JSON. Return complete file contents, not patches."
             ),
