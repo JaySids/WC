@@ -149,15 +149,17 @@ async def _check_sandbox_http(sandbox_id: str) -> dict:
                 status_code = 0
 
             errors = []
+            # Only match indicators that unambiguously signal a runtime
+            # error page.  Avoid substrings that appear in normal Next.js
+            # HTML (e.g. script chunk names like "next-error-*.js", or
+            # hydration "digest=" attributes).
             error_indicators = [
                 "Application error: a client-side exception",
                 "Application error: a server-side exception",
                 "Unhandled Runtime Error",
                 "Internal Server Error",
                 "Error: Minified React error",
-                "digest=",
                 "nextjs__container_errors__",
-                "next-error",
             ]
             for indicator in error_indicators:
                 if indicator in body:
