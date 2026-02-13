@@ -217,14 +217,9 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         if not ready:
             _notify("Timeout waiting for Next.js — proceeding anyway")
 
-        # Use signed preview URL for iframe embedding (no auth header needed)
-        try:
-            signed = sandbox.create_signed_preview_url(3000, expires_in_seconds=7200)
-            preview_url = signed.url if hasattr(signed, 'url') else str(signed)
-        except Exception:
-            # Fallback to regular preview link
-            preview = sandbox.get_preview_link(3000)
-            preview_url = preview.url
+        # Public sandbox — get_preview_link returns a direct URL (no auth frame)
+        preview = sandbox.get_preview_link(3000)
+        preview_url = preview.url
 
         # Read key project files
         initial_files = _read_sandbox_files(sandbox, PROJECT_PATH)
@@ -306,13 +301,9 @@ async def start_sandbox(sandbox_id: str) -> dict:
         sandbox.process.exec(start_cmd)
         time.sleep(5)
 
-        # Use signed preview URL for iframe embedding
-        try:
-            signed = sandbox.create_signed_preview_url(3000, expires_in_seconds=7200)
-            preview_url = signed.url if hasattr(signed, 'url') else str(signed)
-        except Exception:
-            preview = sandbox.get_preview_link(3000)
-            preview_url = preview.url
+        # Public sandbox — get_preview_link returns a direct URL (no auth frame)
+        preview = sandbox.get_preview_link(3000)
+        preview_url = preview.url
         print(f"Sandbox {sandbox_id} started — preview: {preview_url}")
         return {
             "preview_url": preview_url,
