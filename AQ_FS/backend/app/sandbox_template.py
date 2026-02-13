@@ -33,31 +33,15 @@ PACKAGE_JSON = '''{
     "react-dom": "^18.3.1",
 
     "framer-motion": "^11.15.0",
-    "gsap": "^3.12.7",
+    "lucide-react": "^0.469.0",
 
-    "swiper": "^11.1.15",
-    "embla-carousel-react": "^8.5.1",
-
-    "@headlessui/react": "^2.2.0",
     "@radix-ui/react-accordion": "^1.2.2",
     "@radix-ui/react-dialog": "^1.1.4",
-    "@radix-ui/react-dropdown-menu": "^2.1.4",
     "@radix-ui/react-tabs": "^1.1.2",
-    "@radix-ui/react-tooltip": "^1.1.6",
-    "@radix-ui/react-popover": "^1.1.4",
-
-    "lucide-react": "^0.469.0",
-    "react-icons": "^5.4.0",
-    "@heroicons/react": "^2.2.0",
 
     "react-intersection-observer": "^9.14.1",
-    "react-scroll": "^1.9.0",
-    "react-countup": "^6.5.3",
-    "react-type-animation": "^3.2.0",
-
     "clsx": "^2.1.1",
-    "tailwind-merge": "^2.6.0",
-    "class-variance-authority": "^0.7.1"
+    "tailwind-merge": "^2.6.0"
   },
   "devDependencies": {
     "tailwindcss": "^3.4.17",
@@ -192,7 +176,7 @@ async def provision_react_sandbox(progress=None) -> dict:
     Uses the existing create_react_boilerplate_sandbox which:
     1. Creates a Daytona sandbox
     2. Installs bun + scaffolds Next.js via bun create next-app@latest
-    3. Installs extra packages (framer-motion, swiper, Radix, etc.)
+    3. Installs extra packages (framer-motion, lucide-react, Radix, etc.)
     4. Uploads ErrorBoundary component
     5. Starts the dev server
 
@@ -315,10 +299,18 @@ async def upload_files_to_sandbox(sandbox_id: str, files: dict, project_root: st
     await asyncio.to_thread(_upload)
 
 
-async def get_sandbox_logs(sandbox_id: str, project_root: str = None) -> str:
+async def get_sandbox_logs(
+    sandbox_id: str,
+    project_root: str = None,
+    lines: int = 100,
+) -> str:
     """Get Next.js dev server output from the sandbox. Retries on transient errors."""
     if not project_root:
         project_root = PROJECT_PATH
+    if lines < 20:
+        lines = 20
+    if lines > 500:
+        lines = 500
 
     def _get():
         log_file = f"{project_root}/server.log"
@@ -328,7 +320,7 @@ async def get_sandbox_logs(sandbox_id: str, project_root: str = None) -> str:
                 daytona = get_daytona_client()
                 sb = daytona.get(sandbox_id)
                 result = sb.process.exec(
-                    f"tail -100 {log_file} 2>/dev/null || echo 'No logs yet'",
+                    f"tail -{lines} {log_file} 2>/dev/null || echo 'No logs yet'",
                     timeout=15,
                 )
                 return result.result or ""

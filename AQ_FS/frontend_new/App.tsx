@@ -51,7 +51,7 @@ const App: React.FC = () => {
       id: '0',
       timestamp: ts(),
       sender: Sender.SYSTEM,
-      text: 'Session initialized. Enter a URL to start cloning.',
+      text: 'Session initialized. Use the URL bar above to start cloning.',
     }],
   }]);
   const [currentSessionId, setCurrentSessionId] = useState('default');
@@ -191,22 +191,26 @@ const App: React.FC = () => {
         addMsg({ sender: Sender.SYSTEM, text: event.message, metadata: { eventType: 'step' } });
         break;
 
-      case 'scrape_done':
+      case 'scrape_done': {
+        const lines = [`Scraped: ${event.title || 'page'}`];
+        lines.push(`  ${event.sections || 0} sections  ·  ${event.images || 0} images  ·  ${event.screenshots || 0} screenshots`);
+        if (event.page_height) lines.push(`  Page height: ${event.page_height.toLocaleString()}px`);
+        if (event.section_types?.length) lines.push(`  Sections: ${event.section_types.join(', ')}`);
+        if (event.font_families?.length) lines.push(`  Fonts: ${event.font_families.join(', ')}`);
+        if (event.nav_links || event.cta_buttons) lines.push(`  ${event.nav_links || 0} nav links  ·  ${event.cta_buttons || 0} buttons  ·  ${event.svgs || 0} SVGs`);
+        if (event.colors?.length) lines.push(`  Colors: ${event.colors.join('  ')}`);
         addMsg({
           sender: Sender.BOT,
-          text: `Scraped: ${event.title || 'page'} — ${event.sections || 0} sections, ${event.images || 0} images`,
+          text: lines.join('\n'),
           metadata: { domUpdateStatus: 'Scrape complete', eventType: 'scrape_done' },
         });
         break;
+      }
 
       case 'file':
         setFiles(prev => ({ ...prev, [event.path]: event.content }));
         setActiveFile(event.path);
-        addMsg({
-          sender: Sender.BOT,
-          text: `Generated: ${event.path}`,
-          metadata: { files: [event.path], eventType: 'file' },
-        });
+        // Don't spam activity — generation_complete shows the summary
         break;
 
       case 'file_updated':
@@ -231,6 +235,49 @@ const App: React.FC = () => {
         setTimeout(() => {
           if (iframeRef.current) iframeRef.current.src = event.preview_url;
         }, 3000);
+        break;
+
+      case 'generation_complete':
+        setPipelineSteps(prev => {
+          const updated = prev.map(s => ({ ...s, status: 'completed' as const }));
+          return [...updated, { step: 'generation_complete', message: `Generated ${event.file_count || 0} files in ${event.time || '?'}s`, status: 'completed' as const }];
+        });
+        addMsg({
+          sender: Sender.BOT,
+          text: `Code generation complete — ${event.file_count || 0} files in ${event.time || '?'}s`,
+          metadata: {
+            domUpdateStatus: 'Generation complete',
+            files: event.files || [],
+            eventType: 'generation_complete',
+          },
+        });
+        break;
+
+      case 'compiled':
+        addMsg({
+          sender: Sender.BOT,
+          text: event.message || 'Compiled successfully',
+          metadata: { domUpdateStatus: 'Compiled', eventType: 'compiled' },
+        });
+        break;
+
+      case 'compile_errors':
+        addMsg({
+          sender: Sender.BOT,
+          text: `Compilation errors (attempt ${event.attempt || '?'}/3): ${event.error_count || 0} error${(event.error_count || 0) !== 1 ? 's' : ''}`,
+          metadata: {
+            errors: event.report ? [event.report] : [],
+            eventType: 'compile_errors',
+          },
+        });
+        break;
+
+      case 'warning':
+        addMsg({
+          sender: Sender.SYSTEM,
+          text: `Warning: ${event.message}`,
+          metadata: { eventType: 'warning' },
+        });
         break;
 
       case 'agent_message':
@@ -266,24 +313,38 @@ const App: React.FC = () => {
       case 'error':
         setIsCloning(false);
         setPipelineSteps([]);
-        addMsg({ sender: Sender.SYSTEM, text: `Error: ${event.message}`, metadata: { eventType: 'error' } });
+        addMsg({
+          sender: Sender.SYSTEM,
+          text: `Error: ${event.message}`,
+          metadata: { eventType: 'error', cloneIncomplete: true, retryUrl: url },
+        });
         break;
 
-      case 'done':
+      case 'done': {
         setIsCloning(false);
         setPipelineSteps([]);
         if (event.preview_url) setPreviewUrl(event.preview_url);
         if (event.clone_id) setCloneId(event.clone_id);
-        addMsg({
-          sender: Sender.SYSTEM,
-          text: `Clone complete — ${event.iterations || 0} iteration${(event.iterations || 0) !== 1 ? 's' : ''}`,
-          metadata: { domUpdateStatus: 'Clone finished', eventType: 'done' },
-        });
+        const hasSandbox = !!(event.preview_url || event.sandbox_id);
+        if (hasSandbox) {
+          addMsg({
+            sender: Sender.SYSTEM,
+            text: `Clone complete — ${event.iterations || 0} iteration${(event.iterations || 0) !== 1 ? 's' : ''}`,
+            metadata: { domUpdateStatus: 'Clone finished', eventType: 'done' },
+          });
+          setTimeout(() => {
+            if (iframeRef.current && event.preview_url) iframeRef.current.src = event.preview_url;
+          }, 2000);
+        } else {
+          addMsg({
+            sender: Sender.SYSTEM,
+            text: `Clone incomplete — sandbox was not created. You can retry the clone.`,
+            metadata: { domUpdateStatus: 'Clone incomplete', eventType: 'done', cloneIncomplete: true, retryUrl: url },
+          });
+        }
         fetchHistory();
-        setTimeout(() => {
-          if (iframeRef.current && event.preview_url) iframeRef.current.src = event.preview_url;
-        }, 2000);
         break;
+      }
 
       // skip step/thinking/iteration/clone_created from feed (handled above)
       default:
@@ -369,25 +430,6 @@ const App: React.FC = () => {
     addMsg({ sender: Sender.SYSTEM, text: 'Clone stopped' });
   };
 
-  const handleChat = async (text: string) => {
-    if (!text.trim() || !cloneId) return;
-
-    addMsg({ sender: Sender.USER, text, metadata: { isUserAdmin: true } });
-    setIsCloning(true);
-
-    try {
-      const response = await fetch(`${API_URL}/clone/${cloneId}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text.trim() }),
-      });
-      await processStream(response);
-    } catch (error: any) {
-      addMsg({ sender: Sender.SYSTEM, text: `Error: ${error.message}` });
-      setIsCloning(false);
-    }
-  };
-
   const handleNewClone = () => {
     setUrl('');
     setIsCloning(false);
@@ -408,7 +450,7 @@ const App: React.FC = () => {
         id: sid + '-init',
         timestamp: ts(),
         sender: Sender.SYSTEM,
-        text: 'Session initialized. Enter a URL to start cloning.',
+        text: 'Session initialized. Use the URL bar above to start cloning.',
       }],
     };
     setSessions(prev => [newSession, ...prev]);
@@ -494,7 +536,7 @@ const App: React.FC = () => {
   const handleReactivate = async (record: CloneRecord) => {
     setReactivatingId(record.id);
     try {
-      const res = await fetch(`${API_URL}/clone/${record.id}/reactivate`, { method: 'POST' });
+      const res = await fetch(`${API_URL}/clone/${record.id}/rebuild`, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setHistory(prev => prev.map(h =>
@@ -556,10 +598,11 @@ const App: React.FC = () => {
     sessionIdRef.current = id;
     const session = sessions.find(s => s.id === id);
     if (session) {
-      if (session.cloneId) setCloneId(session.cloneId);
-      if (session.previewUrl) setPreviewUrl(session.previewUrl);
-      if (session.url) setUrl(session.url);
-      // outputFormat is always react
+      setCloneId(session.cloneId || '');
+      setPreviewUrl(session.previewUrl || '');
+      setUrl(session.url || '');
+      setFiles({});
+      setActiveFile('');
     }
   };
 
@@ -663,7 +706,6 @@ const App: React.FC = () => {
         <TerminalPane
           currentSession={currentSession}
           sessions={sessions}
-          onSendMessage={cloneId ? handleChat : (text: string) => handleStartClone(text)}
           onCreateSession={handleNewClone}
           onSwitchSession={switchSession}
           onDeleteSession={deleteSession}
@@ -672,6 +714,7 @@ const App: React.FC = () => {
           isCloning={isCloning}
           cloneId={cloneId}
           pipelineSteps={pipelineSteps}
+          onRetry={(retryUrl: string) => handleStartClone(retryUrl)}
         />
       </main>
     </div>

@@ -8,29 +8,15 @@ import re
 # Packages pre-installed in the sandbox (and their subpaths)
 VALID_PACKAGES = {
     "react", "react-dom", "next",
-    "framer-motion", "gsap",
-    "swiper", "embla-carousel-react",
-    "@headlessui/react",
+    "framer-motion",
+    "lucide-react",
     "@radix-ui/react-accordion", "@radix-ui/react-dialog",
-    "@radix-ui/react-dropdown-menu", "@radix-ui/react-tabs",
-    "@radix-ui/react-tooltip", "@radix-ui/react-popover",
-    "lucide-react", "react-icons", "@heroicons/react",
-    "react-intersection-observer", "react-scroll",
-    "react-countup", "react-type-animation",
-    "clsx", "tailwind-merge", "class-variance-authority",
+    "@radix-ui/react-tabs",
+    "react-intersection-observer",
+    "clsx", "tailwind-merge",
     # Subpaths
     "next/font", "next/font/google", "next/font/local",
     "next/image", "next/link", "next/navigation", "next/head",
-    "react-icons/fa", "react-icons/fi", "react-icons/hi",
-    "react-icons/hi2", "react-icons/io", "react-icons/io5",
-    "react-icons/md", "react-icons/bi", "react-icons/bs",
-    "react-icons/ri", "react-icons/si", "react-icons/ai",
-    "react-icons/tb", "react-icons/lu", "react-icons/cg",
-    "@heroicons/react/24/outline", "@heroicons/react/24/solid",
-    "@heroicons/react/20/solid",
-    "swiper/react", "swiper/modules", "swiper/css",
-    "swiper/css/navigation", "swiper/css/pagination",
-    "swiper/css/effect-fade", "swiper/css/autoplay",
 }
 
 

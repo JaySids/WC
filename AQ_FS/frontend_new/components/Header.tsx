@@ -122,7 +122,7 @@ const Header: React.FC<HeaderProps> = ({
         {/* View toggle */}
         <div className="flex items-center gap-0.5 bg-transparent rounded p-0.5 mr-1" role="tablist">
           <button
-            onClick={() => setViewMode(viewMode === 'editor' ? 'split' : 'editor')}
+            onClick={() => setViewMode('editor')}
             className={`px-2 py-1 text-[10px] font-mono transition-colors rounded ${
               viewMode === 'editor' ? 'bg-[#18181b] text-white border border-border-dark' : 'text-gray-500 hover:text-white'
             }`}
@@ -130,7 +130,15 @@ const Header: React.FC<HeaderProps> = ({
             Editor
           </button>
           <button
-            onClick={() => setViewMode(viewMode === 'preview' ? 'split' : 'preview')}
+            onClick={() => setViewMode('split')}
+            className={`px-2 py-1 text-[10px] font-mono transition-colors rounded ${
+              viewMode === 'split' ? 'bg-[#18181b] text-white border border-border-dark' : 'text-gray-500 hover:text-white'
+            }`}
+          >
+            Split
+          </button>
+          <button
+            onClick={() => setViewMode('preview')}
             className={`px-2 py-1 text-[10px] font-mono transition-colors rounded ${
               viewMode === 'preview' ? 'bg-[#18181b] text-white border border-border-dark' : 'text-gray-500 hover:text-white'
             }`}

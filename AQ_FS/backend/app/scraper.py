@@ -66,13 +66,13 @@ async def scrape_website(url: str) -> dict:
         # Intercept ALL requests
         await page.route("**/*", handle_route)
 
-        # Navigate
+        # Navigate — use shorter timeout, fallback quickly
         try:
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            await page.goto(url, wait_until="networkidle", timeout=15000)
         except Exception:
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(3000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                await page.wait_for_timeout(2000)
             except Exception as e2:
                 await browser.close()
                 raise Exception(f"Failed to load {url}: {e2}")
@@ -80,8 +80,8 @@ async def scrape_website(url: str) -> dict:
         # Clean up page
         await prepare_page(page)
 
-        # Wait for additional assets triggered by prepare_page
-        await page.wait_for_timeout(2000)
+        # Brief wait for additional assets triggered by prepare_page
+        await page.wait_for_timeout(1000)
 
         # === CATEGORIZE NETWORK REQUESTS ===
         assets = {
@@ -122,16 +122,20 @@ async def scrape_website(url: str) -> dict:
                 })
 
         # Also catch images in <img> tags (CSS/lazy-loaded)
-        dom_images = await page.evaluate('''() => {
-            return [...document.querySelectorAll('img')]
-                .filter(img => img.src && img.offsetWidth > 0)
-                .map(img => ({
-                    url: img.src,
-                    alt: img.alt || '',
-                    width: img.naturalWidth,
-                    height: img.naturalHeight
-                }));
-        }''')
+        try:
+            dom_images = await page.evaluate('''() => {
+                return [...document.querySelectorAll('img')]
+                    .filter(img => img.src && img.offsetWidth > 0)
+                    .map(img => ({
+                        url: img.src,
+                        alt: img.alt || '',
+                        width: img.naturalWidth,
+                        height: img.naturalHeight
+                    }));
+            }''')
+        except Exception as e:
+            print(f"  [scrape] DOM images extraction failed: {e}")
+            dom_images = []
 
         # Merge DOM images with network images (dedup by URL)
         image_urls = set(a["url"] for a in assets["images"])
@@ -152,19 +156,23 @@ async def scrape_website(url: str) -> dict:
         ]
 
         # === EXTRACT FONT FAMILIES from @font-face rules ===
-        font_families = await page.evaluate('''() => {
-            const families = new Set();
-            for (const sheet of document.styleSheets) {
-                try {
-                    for (const rule of sheet.cssRules) {
-                        if (rule instanceof CSSFontFaceRule) {
-                            families.add(rule.style.fontFamily.replace(/['"]/g, ''));
+        try:
+            font_families = await page.evaluate('''() => {
+                const families = new Set();
+                for (const sheet of document.styleSheets) {
+                    try {
+                        for (const rule of sheet.cssRules) {
+                            if (rule instanceof CSSFontFaceRule) {
+                                families.add(rule.style.fontFamily.replace(/['"]/g, ''));
+                            }
                         }
-                    }
-                } catch(e) {}
-            }
-            return [...families];
-        }''')
+                    } catch(e) {}
+                }
+                return [...families];
+            }''')
+        except Exception as e:
+            print(f"  [scrape] Font families extraction failed: {e}")
+            font_families = []
 
         # Attach family names to font assets where possible
         for font_asset in assets["fonts"]:
@@ -175,7 +183,8 @@ async def scrape_website(url: str) -> dict:
                     break
 
         # === EXTRACT THEME (computed styles) ===
-        theme = await page.evaluate('''() => {
+        try:
+            theme = await page.evaluate('''() => {
             const result = { colors: {}, fonts: {} };
 
             function rgbToHex(rgb) {
@@ -291,14 +300,18 @@ async def scrape_website(url: str) -> dict:
 
             return result;
         }''')
+        except Exception as e:
+            print(f"  [scrape] Theme extraction failed: {e}")
+            theme = {"colors": {}, "fonts": {}}
 
-        theme["fonts"]["google_font_urls"] = google_font_urls
-        theme["fonts"]["custom_fonts"] = font_families
+        theme.setdefault("fonts", {})["google_font_urls"] = google_font_urls
+        theme.setdefault("fonts", {})["custom_fonts"] = font_families
 
         # === EXTRACT CLICKABLES ===
         base_domain = urlparse(url).scheme + "://" + urlparse(url).netloc
 
-        clickables = await page.evaluate('''(baseDomain) => {
+        try:
+            clickables = await page.evaluate('''(baseDomain) => {
             const result = { nav_links: [], cta_buttons: [], footer_links: [], all_links: [] };
 
             function rgbToHex(rgb) {
@@ -368,9 +381,13 @@ async def scrape_website(url: str) -> dict:
 
             return result;
         }''', base_domain)
+        except Exception as e:
+            print(f"  [scrape] Clickables extraction failed: {e}")
+            clickables = {"nav_links": [], "cta_buttons": [], "footer_links": [], "all_links": []}
 
         # === EXTRACT SVGs ===
-        svgs = await page.evaluate('''() => {
+        try:
+            svgs = await page.evaluate('''() => {
             // Broader SVG search: look everywhere including inside containers
             const allSvgs = [...document.querySelectorAll('svg')];
 
@@ -398,64 +415,40 @@ async def scrape_website(url: str) -> dict:
                     };
                 });
         }''')
+        except Exception as e:
+            print(f"  [scrape] SVGs extraction failed: {e}")
+            svgs = []
 
         # === EXTRACT TEXT CONTENT ===
-        text_content = await page.evaluate('''() => {
-            return document.body.innerText.slice(0, 8000);
-        }''')
+        try:
+            text_content = await page.evaluate('''() => {
+                return document.body.innerText.slice(0, 8000);
+            }''')
+        except Exception as e:
+            print(f"  [scrape] Text content extraction failed: {e}")
+            text_content = ""
 
         # === EXTRACT META ===
-        meta = await page.evaluate('''() => {
-            return {
-                title: document.title,
-                description: document.querySelector('meta[name="description"]')?.content || '',
-                og_image: document.querySelector('meta[property="og:image"]')?.content || '',
-                favicon: document.querySelector('link[rel="icon"]')?.href ||
-                         document.querySelector('link[rel="shortcut icon"]')?.href || ''
-            };
+        try:
+            meta = await page.evaluate('''() => {
+                return {
+                    title: document.title,
+                    description: document.querySelector('meta[name="description"]')?.content || '',
+                    og_image: document.querySelector('meta[property="og:image"]')?.content || '',
+                    favicon: document.querySelector('link[rel="icon"]')?.href ||
+                             document.querySelector('link[rel="shortcut icon"]')?.href || ''
+                };
         }''')
+        except Exception as e:
+            print(f"  [scrape] Meta extraction failed: {e}")
+            meta = {"title": "", "description": "", "og_image": "", "favicon": ""}
 
         # === EXTRACT SECTIONS (structured DOM) ===
-        sections = await extract_sections(page)
-
-        # === EXTRACT DOM SKELETON (layout annotations) ===
         try:
-            dom_skeleton = await extract_dom_skeleton(page)
-        except Exception:
-            dom_skeleton = ""
-
-        # === EXTRACT BACKGROUND IMAGES ===
-        try:
-            backgrounds = await extract_background_images(page)
-        except Exception:
-            backgrounds = []
-
-        # === EXTRACT ANIMATIONS ===
-        animations = await extract_animations(page)
-
-        # === EXTRACT INTERACTIVE PATTERNS ===
-        try:
-            ui_patterns = await extract_ui_patterns(page)
-        except Exception:
-            ui_patterns = []
-
-        # === EXTRACT BUTTON BEHAVIORS ===
-        try:
-            button_behaviors = await extract_button_behaviors(page)
-        except Exception:
-            button_behaviors = []
-
-        # === EXTRACT FRAMEWORK / REACT INFO ===
-        try:
-            react_info = await extract_react_info(page)
-        except Exception:
-            react_info = {}
-
-        # === SCRAPE INTERACTIVE ELEMENTS (tabs, accordions, toggles, dropdowns) ===
-        try:
-            interactives = await scrape_interactive_elements(page)
-        except Exception:
-            interactives = []
+            sections = await extract_sections(page)
+        except Exception as e:
+            print(f"  [scrape] Sections extraction failed: {e}")
+            sections = []
 
         # === SCREENSHOTS (compressed to JPEG at capture time) ===
         page_height = await page.evaluate("document.body.scrollHeight")
@@ -467,14 +460,21 @@ async def scrape_website(url: str) -> dict:
         viewport_b64, _ = screenshot_to_b64(viewport_bytes, compress=True)
 
         # Full page thumbnail (resized + compressed)
+        # Cap page height to avoid OOM on very tall pages
+        max_full_page_height = 12000
+        if page_height > max_full_page_height:
+            await page.evaluate(f"document.body.style.maxHeight = '{max_full_page_height}px'")
         full_bytes = await page.screenshot(full_page=True)
+        if page_height > max_full_page_height:
+            await page.evaluate("document.body.style.maxHeight = ''")
         full_b64, _ = screenshot_to_b64(full_bytes, compress=True, max_width=1024, quality=60)
 
-        # Viewport-scroll screenshots for chunked generation
+        # Viewport-scroll screenshots for chunked generation (capped at 6)
         scroll_screenshots = []
         scroll_step = 880  # 1080 - 200 overlap
+        max_scroll_screenshots = 6
         y = 0
-        while y < page_height:
+        while y < page_height and len(scroll_screenshots) < max_scroll_screenshots:
             await page.evaluate(f"window.scrollTo(0, {y})")
             await page.wait_for_timeout(300)
             chunk_bytes = await page.screenshot()
@@ -496,13 +496,6 @@ async def scrape_website(url: str) -> dict:
         "text_content": text_content,
         "svgs": svgs,
         "sections": sections,
-        "dom_skeleton": dom_skeleton,
-        "backgrounds": backgrounds,
-        "animations": animations,
-        "ui_patterns": ui_patterns,
-        "button_behaviors": button_behaviors,
-        "interactives": interactives,
-        "react_info": react_info,
         "page_height": page_height,
         "screenshots": {
             "viewport": viewport_b64,
@@ -2125,15 +2118,19 @@ async def prepare_page(page):
         }
     }''')
 
-    # Scroll to trigger lazy loading
+    # Scroll to trigger lazy loading (capped to avoid infinite scroll pages)
     await page.evaluate('''async () => {
         await new Promise(resolve => {
             let total = 0;
             const distance = 400;
+            const maxScroll = 15000;
+            let iterations = 0;
+            const maxIterations = 50;
             const timer = setInterval(() => {
                 window.scrollBy(0, distance);
                 total += distance;
-                if (total >= document.body.scrollHeight) {
+                iterations++;
+                if (total >= document.body.scrollHeight || total >= maxScroll || iterations >= maxIterations) {
                     clearInterval(timer);
                     window.scrollTo(0, 0);
                     resolve();

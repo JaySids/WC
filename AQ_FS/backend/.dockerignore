@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+.git
+.gitignore
+output/
+*.egg-info
+.venv
+venv
+.mypy_cache
+.pytest_cache
+Dockerfile
+.dockerignore
+railway.toml

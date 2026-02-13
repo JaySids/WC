@@ -34,6 +34,8 @@ export interface Message {
     issues?: string[];
     phase?: string;
     eventType?: string;
+    cloneIncomplete?: boolean;
+    retryUrl?: string;
   };
 }
 

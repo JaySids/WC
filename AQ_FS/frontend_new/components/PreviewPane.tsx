@@ -67,13 +67,11 @@ const PreviewPane: React.FC<PreviewPaneProps> = ({
 }) => {
   const [tab, setTab] = useState<'preview' | 'files'>('preview');
 
-  if (!isVisible) return null;
-
   const fileNames = Object.keys(files);
   const treeNodes = buildTree(fileNames);
 
   return (
-    <section className="flex-1 flex flex-col min-w-0 bg-[#09090b] relative border-r border-border-dark">
+    <section className={`flex-1 flex flex-col min-w-0 bg-[#09090b] relative border-r border-border-dark ${!isVisible ? 'hidden' : ''}`}>
       {/* Tab bar + URL bar */}
       <div className="h-10 bg-[#0c0c0e] border-b border-border-dark flex items-center px-2 gap-0 shrink-0">
         <button

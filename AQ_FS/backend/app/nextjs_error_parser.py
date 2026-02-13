@@ -173,6 +173,67 @@ def parse_nextjs_errors(log_output: str) -> dict:
     }
 
 
+def parse_runtime_errors(log_output: str) -> dict:
+    """
+    Parse runtime errors from Next.js dev server logs.
+
+    Returns:
+        {
+            "has_errors": bool,
+            "errors": [
+                {"type": "runtime_error", "file": str | None, "line": int | None, "message": str}
+            ]
+        }
+    """
+    if not log_output:
+        return {"has_errors": False, "errors": []}
+
+    # If we have a LOG_MARKER, only look at content after the LAST marker
+    marker_parts = re.split(r"=== LOG_MARKER_\d+ ===", log_output)
+    if len(marker_parts) > 1:
+        log_output = marker_parts[-1]
+
+    errors = []
+
+    # Catch explicit runtime error banners
+    for m in re.finditer(r"(Unhandled Runtime Error|Runtime Error|Unhandled Error)", log_output):
+        nearby = log_output[m.start():m.start() + 800]
+        msg = _first_error_message(nearby) or m.group(1)
+        file, line = _extract_stack_file_line(nearby)
+        errors.append({
+            "type": "runtime_error",
+            "file": file,
+            "line": line,
+            "message": msg[:300],
+        })
+
+    # Generic Error/TypeError/ReferenceError with stack traces
+    for m in re.finditer(r"\b(TypeError|ReferenceError|RangeError|Error):\s*([^\n]+)", log_output):
+        msg = f"{m.group(1)}: {m.group(2).strip()}"
+        nearby = log_output[m.start():m.start() + 800]
+        file, line = _extract_stack_file_line(nearby)
+        errors.append({
+            "type": "runtime_error",
+            "file": file,
+            "line": line,
+            "message": msg[:300],
+        })
+
+    # Deduplicate
+    seen = set()
+    unique_errors = []
+    for e in errors:
+        key = (e["type"], e.get("file"), e["message"][:100])
+        if key not in seen:
+            seen.add(key)
+            unique_errors.append(e)
+
+    return {
+        "has_errors": len(unique_errors) > 0,
+        "errors": unique_errors,
+    }
+
+
 def format_nextjs_errors(parsed: dict) -> str:
     """Format parsed errors into a string for Claude to fix."""
     if not parsed["errors"]:
@@ -216,4 +277,27 @@ def _find_nearby_file(log_output: str, position: int) -> str | None:
     files = re.findall(r"(\./[\w/.-]+\.(?:tsx?|jsx?|css))", window)
     if files:
         return _extract_project_path(files[-1])
+    return None
+
+
+def _extract_stack_file_line(text: str) -> tuple[str | None, int | None]:
+    """Extract a project-relative file and line from a stack trace snippet."""
+    # Absolute path with line/col
+    m = re.search(r"(/[^ )]+?\.(?:tsx?|jsx?|js|ts)):(\d+):(\d+)", text)
+    if m:
+        return _extract_project_path(m.group(1)), int(m.group(2))
+    # Relative path with line/col
+    m = re.search(r"(\./[\w/.-]+\.(?:tsx?|jsx?|js|ts)):(\d+):(\d+)", text)
+    if m:
+        return _extract_project_path(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def _first_error_message(text: str) -> str | None:
+    """Get the first readable error message line."""
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if "Error" in line or "Runtime" in line:
+            return line.strip()
     return None

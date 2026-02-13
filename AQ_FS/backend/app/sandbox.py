@@ -1,6 +1,9 @@
 """
-Daytona sandbox management — deploy cloned HTML or React apps to a live preview URL.
+Daytona sandbox management — deploy React apps to a live preview URL.
 Uses the `daytona` package (v0.141+) with process.exec() API.
+
+Sandboxes auto-stop after SANDBOX_TTL_MINUTES of inactivity.
+A background monitor updates Supabase when sandboxes go down.
 """
 
 import asyncio
@@ -12,29 +15,8 @@ from daytona import Daytona, DaytonaConfig, CreateSandboxFromSnapshotParams
 from app.config import get_settings
 
 
-SERVER_SCRIPT = '''\
-import http.server
-import socketserver
-import os
-
-os.chdir("/home/daytona")
-
-class CORSHandler(http.server.SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.end_headers()
-
-with socketserver.TCPServer(("0.0.0.0", 3000), CORSHandler) as httpd:
-    print("Serving on port 3000")
-    httpd.serve_forever()
-'''
+# Sandbox auto-stop after N minutes of inactivity (Daytona-managed)
+SANDBOX_TTL_MINUTES = 30
 
 
 def _get_api_key():
@@ -46,71 +28,8 @@ def _get_api_key():
 
 
 def get_daytona_client() -> Daytona:
-    """Get a configured Daytona client. Shared by sandbox.py and tool_handlers.py."""
+    """Get a configured Daytona client."""
     return Daytona(DaytonaConfig(api_key=_get_api_key()))
-
-
-async def deploy_to_sandbox(html_content: str) -> dict:
-    """
-    Deploy HTML to a Daytona sandbox (legacy interface).
-    Returns { "preview_url": "...", "sandbox_id": "...", "project_root": "..." }
-    """
-    return await deploy_html_to_sandbox(html_content)
-
-
-async def deploy_html_to_sandbox(html_content: str) -> dict:
-    """
-    Deploy a single HTML file to a Daytona sandbox with a CORS Python server.
-    Returns { "preview_url": "...", "sandbox_id": "...", "project_root": "..." }
-    """
-
-    def _deploy():
-        daytona = get_daytona_client()
-
-        # public=True at creation time so the preview URL works from any device
-        # auto_stop_interval=0 disables Daytona's default auto-stop timer
-        # auto_archive_interval set high to prevent archiving (0 = "max default", not "never")
-        params = CreateSandboxFromSnapshotParams(
-            public=True,
-            auto_stop_interval=0,
-            auto_archive_interval=7 * 24 * 60,  # 7 days in minutes
-        )
-        sandbox = daytona.create(params, timeout=60)
-
-        # Belt-and-suspenders: explicitly set intervals on the live sandbox
-        try:
-            sandbox.set_autostop_interval(0)
-            sandbox.set_auto_archive_interval(7 * 24 * 60)
-        except Exception:
-            pass
-
-        # Upload cloned HTML
-        sandbox.fs.upload_file(
-            html_content.encode("utf-8"),
-            "/home/daytona/index.html",
-        )
-
-        # Upload CORS-enabled HTTP server
-        sandbox.fs.upload_file(
-            SERVER_SCRIPT.encode("utf-8"),
-            "/home/daytona/server.py",
-        )
-
-        # Start the web server
-        sandbox.process.exec("nohup python3 /home/daytona/server.py > /home/daytona/server.log 2>&1 &")
-
-        # Wait for server to start
-        time.sleep(3)
-
-        preview = sandbox.get_preview_link(3000)
-
-        return {
-            "preview_url": preview.url,
-            "sandbox_id": sandbox.id,
-            "project_root": "/home/daytona",
-        }
-
-    return await asyncio.to_thread(_deploy)
 
 
 # ── Next.js Project Setup (bun create next-app@latest) ─────────────────────
@@ -155,16 +74,15 @@ export default class ErrorBoundary extends Component<Props, State> {
 }'''
 
 # Extra packages installed on top of what create-next-app provides
+# Keep this minimal — fewer packages = faster sandbox creation + simpler clones
 EXTRA_PACKAGES = [
-    "framer-motion", "gsap", "swiper", "embla-carousel-react",
-    "@headlessui/react",
-    "@radix-ui/react-accordion", "@radix-ui/react-dialog",
-    "@radix-ui/react-dropdown-menu", "@radix-ui/react-tabs",
-    "@radix-ui/react-tooltip", "@radix-ui/react-popover",
-    "lucide-react", "react-icons", "@heroicons/react",
-    "react-intersection-observer", "react-scroll",
-    "react-countup", "react-type-animation",
-    "clsx", "tailwind-merge", "class-variance-authority",
+    "framer-motion",                  # Animations (only if original site has them)
+    "lucide-react",                   # Icons
+    "@radix-ui/react-accordion",      # Accordion/FAQ sections
+    "@radix-ui/react-dialog",         # Modals
+    "@radix-ui/react-tabs",           # Tab components
+    "react-intersection-observer",    # Scroll-triggered visibility
+    "clsx", "tailwind-merge",         # className merging
 ]
 
 # Key project files to read back from the sandbox for the frontend file explorer
@@ -200,9 +118,7 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
     `bun create next-app@latest` (latest Next.js + TypeScript + Tailwind v4).
     Installs extra interactive packages, uploads ErrorBoundary, starts dev server.
 
-    Args:
-        progress: Optional thread-safe queue for reporting progress messages
-                  to the SSE stream. Each item is a string message.
+    Sandboxes auto-stop after SANDBOX_TTL_MINUTES of inactivity.
 
     Returns { "preview_url": "...", "sandbox_id": "...", "project_root": "...", "initial_files": {...} }
     """
@@ -212,61 +128,66 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         if progress:
             progress.put(msg)
 
+    def _exec(sandbox, cmd, timeout=60, retries=2):
+        """Run a command with retry on timeout."""
+        for attempt in range(retries):
+            try:
+                return sandbox.process.exec(cmd, timeout=timeout)
+            except Exception as e:
+                if attempt < retries - 1 and "timeout" in str(e).lower():
+                    _notify(f"  Command timed out, retrying ({attempt + 1}/{retries})...")
+                    time.sleep(2)
+                else:
+                    raise
+
     def _create():
         daytona = get_daytona_client()
 
-        # Create a public sandbox (public=True at creation time for universal access)
-        # auto_stop_interval=0 disables Daytona's default auto-stop timer
-        # auto_archive_interval set high to prevent archiving (0 = "max default", not "never")
         _notify("Provisioning cloud sandbox...")
         params = CreateSandboxFromSnapshotParams(
             language="typescript",
             public=True,
-            auto_stop_interval=0,
+            auto_stop_interval=SANDBOX_TTL_MINUTES,
             auto_archive_interval=7 * 24 * 60,  # 7 days in minutes
         )
         sandbox = daytona.create(params, timeout=120)
 
-        # Belt-and-suspenders: explicitly set intervals on the live sandbox
         try:
-            sandbox.set_autostop_interval(0)
+            sandbox.set_autostop_interval(SANDBOX_TTL_MINUTES)
             sandbox.set_auto_archive_interval(7 * 24 * 60)
         except Exception:
             pass
 
         # Install bun & kill stale processes
         _notify("Installing bun runtime...")
-        sandbox.process.exec("curl -fsSL https://bun.sh/install | bash", timeout=60)
+        _exec(sandbox, "curl -fsSL https://bun.sh/install | bash", timeout=60)
         sandbox.process.exec("pkill -f next || true; pkill -f bun || true")
 
         # Scaffold Next.js project (latest — TypeScript + Tailwind + App Router)
-        _notify("Scaffolding Next.js project (bun create next-app@latest)...")
-        sandbox.process.exec(
+        _notify("Scaffolding Next.js project...")
+        _exec(
+            sandbox,
             f"{BUN_BIN} create next-app@latest {PROJECT_PATH} "
             f"--typescript --tailwind --eslint --app --use-bun --yes",
-            timeout=120,
+            timeout=90,
         )
 
-        # Ensure dependencies are properly installed
-        _notify("Running bun install...")
-        sandbox.process.exec(f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=60)
-
-        # Install extra interactive packages
-        _notify("Installing interactive packages (framer-motion, swiper, Radix, etc.)...")
-        sandbox.process.exec(
+        # Install extra packages in one shot (skip separate bun install — scaffold already did it)
+        _notify("Installing extra packages...")
+        _exec(
+            sandbox,
             f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
-            timeout=120,
+            timeout=90,
         )
 
         # Upload ErrorBoundary component
-        _notify("Uploading ErrorBoundary component...")
         sandbox.process.exec(f"mkdir -p {PROJECT_PATH}/components", timeout=5)
         sandbox.fs.upload_file(
             ERROR_BOUNDARY_TSX.strip().encode("utf-8"),
             f"{PROJECT_PATH}/components/ErrorBoundary.tsx",
         )
 
-        # Start dev server (using --bun flag for bun runtime)
+        # Start dev server
         _notify("Starting Next.js dev server...")
         log_file = f"{PROJECT_PATH}/server.log"
         start_cmd = (
@@ -275,10 +196,10 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
         )
         sandbox.process.exec(start_cmd)
 
-        # Wait for dev server to actually be ready (poll logs)
-        _notify("Waiting for Next.js to compile...")
+        # Wait for dev server — shorter poll (15 attempts x 2s = 30s max)
+        _notify("Waiting for compilation...")
         ready = False
-        for _ in range(30):  # up to 60s (30 x 2s)
+        for _ in range(15):
             time.sleep(2)
             try:
                 logs = sandbox.process.exec(f"tail -20 {log_file} 2>/dev/null", timeout=5)
@@ -298,10 +219,8 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
 
         preview = sandbox.get_preview_link(3000)
 
-        # Read all key project files so the frontend can show them
-        _notify("Reading project files...")
+        # Read key project files
         initial_files = _read_sandbox_files(sandbox, PROJECT_PATH)
-
         _notify(f"Sandbox ready — {len(initial_files)} files loaded")
 
         return {
@@ -311,11 +230,19 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
             "initial_files": initial_files,
         }
 
-    return await asyncio.to_thread(_create)
+    # Retry entire sandbox creation once on failure
+    try:
+        return await asyncio.to_thread(_create)
+    except Exception as first_err:
+        _notify(f"Sandbox creation failed ({first_err}), retrying...")
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception:
+            raise first_err  # Raise original error
 
 
 async def stop_sandbox(sandbox_id: str, delete: bool = False):
-    """Stop or delete a Daytona sandbox."""
+    """Stop or delete a Daytona sandbox. Updates Supabase is_active."""
     settings = get_settings()
     if not settings.daytona_api_key:
         return
@@ -335,6 +262,18 @@ async def stop_sandbox(sandbox_id: str, delete: bool = False):
 
     await asyncio.to_thread(_stop)
 
+    # Remove from active tracking
+    from app.agent import active_sandboxes
+    active_sandboxes.pop(sandbox_id, None)
+
+    # Mark inactive in Supabase
+    try:
+        from app.database import _get_client as get_db
+        db = get_db()
+        db.table("clones").update({"is_active": False}).eq("sandbox_id", sandbox_id).execute()
+    except Exception as e:
+        print(f"[stop_sandbox] DB update failed: {e}")
+
 
 async def start_sandbox(sandbox_id: str) -> dict:
     """Start a stopped Daytona sandbox and restart the dev server."""
@@ -343,9 +282,9 @@ async def start_sandbox(sandbox_id: str) -> dict:
         sandbox = daytona.get(sandbox_id)
         daytona.start(sandbox)
 
-        # Ensure sandbox stays alive after restart
+        # Set auto-stop timer
         try:
-            sandbox.set_autostop_interval(0)
+            sandbox.set_autostop_interval(SANDBOX_TTL_MINUTES)
             sandbox.set_auto_archive_interval(7 * 24 * 60)
         except Exception:
             pass
@@ -372,32 +311,68 @@ async def start_sandbox(sandbox_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Background Keep-Alive — ping all tracked sandboxes every 5 minutes
+# Background Sandbox Monitor — checks for expired sandboxes, updates Supabase
 # ---------------------------------------------------------------------------
 
-async def _keep_alive_loop():
-    """Periodically refresh activity on all active sandboxes to prevent auto-stop/archive."""
+async def _sandbox_monitor_loop():
+    """
+    Periodically check all tracked sandboxes.
+    - Sandboxes that have been stopped by Daytona's auto-stop → mark inactive in Supabase
+    - Sandboxes running beyond TTL with no user activity → clean up
+    """
     while True:
         await asyncio.sleep(5 * 60)  # every 5 minutes
         try:
-            from app.tool_handlers import active_sandboxes
+            from app.agent import active_sandboxes
+
             sandbox_ids = list(active_sandboxes.keys())
             if not sandbox_ids:
                 continue
-            print(f"[keep-alive] Pinging {len(sandbox_ids)} sandbox(es)...")
+
+            print(f"[sandbox-monitor] Checking {len(sandbox_ids)} sandbox(es)...")
+
             for sid in sandbox_ids:
                 try:
-                    def _ping(sandbox_id=sid):
-                        daytona = get_daytona_client()
-                        sandbox = daytona.get(sandbox_id)
-                        sandbox.refresh_activity()
-                    await asyncio.to_thread(_ping)
+                    info = active_sandboxes.get(sid, {})
+                    created_at = info.get("created_at", 0)
+                    age_minutes = (time.time() - created_at) / 60 if created_at else 0
+
+                    # Check if sandbox is still reachable
+                    def _check(sandbox_id=sid):
+                        try:
+                            daytona = get_daytona_client()
+                            sandbox = daytona.get(sandbox_id)
+                            # If we can get it, it's still alive
+                            return True
+                        except Exception:
+                            return False
+
+                    is_alive = await asyncio.to_thread(_check)
+
+                    if not is_alive:
+                        print(f"[sandbox-monitor] {sid[:12]} is stopped/gone — marking inactive")
+                        active_sandboxes.pop(sid, None)
+
+                        # Update Supabase
+                        try:
+                            from app.database import _get_client as get_db
+                            db = get_db()
+                            db.table("clones").update(
+                                {"is_active": False}
+                            ).eq("sandbox_id", sid).execute()
+                        except Exception as e:
+                            print(f"[sandbox-monitor] DB update failed for {sid[:12]}: {e}")
+
+                    elif age_minutes > 0:
+                        print(f"[sandbox-monitor] {sid[:12]} alive ({age_minutes:.0f}m old)")
+
                 except Exception as e:
-                    print(f"[keep-alive] Failed to ping {sid}: {e}")
+                    print(f"[sandbox-monitor] Error checking {sid[:12]}: {e}")
+
         except Exception as e:
-            print(f"[keep-alive] Error: {e}")
+            print(f"[sandbox-monitor] Loop error: {e}")
 
 
-def start_keep_alive():
-    """Start the keep-alive background task. Call from server lifespan."""
-    asyncio.create_task(_keep_alive_loop())
+def start_sandbox_monitor():
+    """Start the sandbox monitor background task. Call from server lifespan."""
+    asyncio.create_task(_sandbox_monitor_loop())
