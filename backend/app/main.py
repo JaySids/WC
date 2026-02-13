@@ -132,19 +132,35 @@ class ToggleActiveRequest(BaseModel):
 
 @app.patch("/clone/{clone_id}/active")
 async def toggle_clone_active_endpoint(clone_id: str, request: ToggleActiveRequest):
-    """Toggle a clone's active status. Stops the sandbox if deactivating."""
+    """Toggle a clone's active status. Deletes the sandbox if deactivating."""
     try:
-        from app.database import get_clone, toggle_clone_active
+        from app.database import get_clone, toggle_clone_active, update_clone, sync_files_to_supabase
+        from app.agent import _chat_sessions
         clone = await get_clone(clone_id)
         if not clone:
             raise HTTPException(status_code=404, detail="Clone not found")
 
         if not request.is_active and clone.get("sandbox_id"):
+            # Sync latest files to Supabase before destroying
+            session = _chat_sessions.get(clone_id)
+            if session and session.get("files"):
+                try:
+                    await sync_files_to_supabase(clone_id, session["files"])
+                except Exception as e:
+                    print(f"[toggle_active] File sync failed: {e}")
+
+            # DELETE the sandbox (not just stop) to free resources
             try:
                 from app.sandbox import stop_sandbox
-                await stop_sandbox(clone["sandbox_id"])
+                await stop_sandbox(clone["sandbox_id"], delete=True)
             except Exception as e:
-                print(f"Failed to stop sandbox: {e}")
+                print(f"Failed to delete sandbox: {e}")
+
+            # Clear sandbox_id since it no longer exists
+            await update_clone(clone_id, {"sandbox_id": None})
+
+            # Clean up in-memory session
+            _chat_sessions.pop(clone_id, None)
 
         updated = await toggle_clone_active(clone_id, request.is_active)
         return {"status": "updated", "is_active": request.is_active, "clone": updated}
@@ -154,11 +170,57 @@ async def toggle_clone_active_endpoint(clone_id: str, request: ToggleActiveReque
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/clone/{clone_id}/deactivate")
+async def deactivate_clone_endpoint(clone_id: str):
+    """
+    Deactivate a clone: sync files to Supabase, delete the sandbox, mark inactive.
+    Designed to be fire-and-forget from the frontend — never raises HTTPException.
+    """
+    try:
+        from app.database import get_clone, update_clone, sync_files_to_supabase
+        from app.agent import _chat_sessions
+
+        clone = await get_clone(clone_id)
+        if not clone:
+            return {"status": "not_found"}
+
+        # Sync latest in-memory files before destroying
+        session = _chat_sessions.get(clone_id)
+        if session and session.get("files"):
+            try:
+                await sync_files_to_supabase(clone_id, session["files"])
+            except Exception as e:
+                print(f"[deactivate] File sync failed: {e}")
+
+        # Delete the Daytona sandbox
+        sandbox_id = clone.get("sandbox_id")
+        if sandbox_id:
+            try:
+                from app.sandbox import stop_sandbox
+                await stop_sandbox(sandbox_id, delete=True)
+            except Exception as e:
+                print(f"[deactivate] Sandbox delete failed: {e}")
+
+        # Update DB: mark inactive, clear sandbox_id
+        await update_clone(clone_id, {
+            "is_active": False,
+            "sandbox_id": None,
+        })
+
+        # Clean up in-memory session
+        _chat_sessions.pop(clone_id, None)
+
+        return {"status": "deactivated"}
+    except Exception as e:
+        print(f"[deactivate] Error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/clone/{clone_id}/rebuild")
 async def rebuild_clone_endpoint(clone_id: str):
     """
-    Rebuild a previous clone by creating a new sandbox and uploading saved files.
-    Reads files from Supabase metadata.
+    Rebuild a previous clone by creating a brand-new sandbox and uploading saved files.
+    Old sandbox is always deleted on navigate-away, so we always create fresh.
     """
     try:
         from app.database import get_clone, update_clone
@@ -171,53 +233,17 @@ async def rebuild_clone_endpoint(clone_id: str):
         if not saved_files:
             raise HTTPException(status_code=400, detail="No saved files to rebuild from")
 
-        # Try to start the existing sandbox first
-        sandbox_id = clone.get("sandbox_id")
-        if sandbox_id:
-            try:
-                from app.sandbox import start_sandbox
-                sandbox_result = await start_sandbox(sandbox_id)
-
-                # Re-upload saved files to restore state
-                from app.sandbox_template import upload_files_to_sandbox
-                from app.sandbox import PROJECT_PATH
-                await upload_files_to_sandbox(
-                    sandbox_result["sandbox_id"],
-                    saved_files,
-                    project_root=sandbox_result.get("project_root", PROJECT_PATH),
-                )
-
-                await update_clone(clone_id, {
-                    "preview_url": sandbox_result["preview_url"],
-                    "is_active": True,
-                })
-
-                from app.agent import active_sandboxes
-                import time
-                active_sandboxes[sandbox_result["sandbox_id"]] = {
-                    **sandbox_result,
-                    "created_at": time.time(),
-                }
-
-                return {
-                    "status": "rebuilt",
-                    "preview_url": sandbox_result["preview_url"],
-                    "sandbox_id": sandbox_result["sandbox_id"],
-                }
-            except Exception as e:
-                print(f"Failed to restart existing sandbox {sandbox_id}: {e}, creating new one...")
-
-        # Fallback: create a new sandbox on demand
+        # Always create a fresh sandbox
         from app.sandbox import create_react_boilerplate_sandbox
         sandbox_result = await create_react_boilerplate_sandbox()
         project_root = sandbox_result.get("project_root", "/home/daytona/my-app")
 
         # Upload saved files
         from app.sandbox_template import upload_files_to_sandbox
-        from app.agent import _touch_sandbox_files, active_sandboxes
+        from app.agent import _touch_sandbox_files, active_sandboxes, _chat_sessions
         import time
 
-        # Remove conflicting .tsx files
+        # Remove conflicting .tsx files (scaffolded defaults) if we have .jsx versions
         tsx_to_remove = [fp.replace(".jsx", ".tsx") for fp in saved_files if fp.endswith(".jsx")]
         if tsx_to_remove:
             from app.sandbox import get_daytona_client
@@ -254,7 +280,6 @@ async def rebuild_clone_endpoint(clone_id: str):
         }
 
         # Restore chat session
-        from app.agent import _chat_sessions
         _chat_sessions[clone_id] = {
             "files": saved_files,
             "state": {

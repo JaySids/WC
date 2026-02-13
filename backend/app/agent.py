@@ -1190,6 +1190,14 @@ async def hot_fix_file(clone_id: str, filepath: str, content: str) -> dict:
     # Touch to trigger HMR
     await _touch_sandbox_files(sandbox_id, [filepath], project_root)
 
+    # Sync latest files to Supabase so rebuilds use the latest version
+    if session and session.get("files"):
+        try:
+            from app.database import sync_files_to_supabase
+            await sync_files_to_supabase(clone_id, session["files"])
+        except Exception as e:
+            print(f"  [hot_fix_file] Supabase sync failed: {e}")
+
     return {"status": "updated", "filepath": filepath, "sandbox_id": sandbox_id}
 
 
@@ -1404,6 +1412,13 @@ async def run_chat_followup(
     })
 
     _chat_sessions[clone_id] = session
+
+    # Sync latest files to Supabase so rebuilds use the latest version
+    try:
+        from app.database import sync_files_to_supabase
+        await sync_files_to_supabase(clone_id, files)
+    except Exception as e:
+        print(f"  [chat_followup] Supabase sync failed: {e}")
 
 
 # ---------------------------------------------------------------

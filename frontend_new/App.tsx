@@ -69,6 +69,9 @@ const App: React.FC = () => {
   // keep a mutable ref for the current session id so SSE callbacks see latest
   const sessionIdRef = useRef(currentSessionId);
   useEffect(() => { sessionIdRef.current = currentSessionId; }, [currentSessionId]);
+  // keep a mutable ref for cloneId so deactivation callbacks see latest
+  const cloneIdRef = useRef(cloneId);
+  useEffect(() => { cloneIdRef.current = cloneId; }, [cloneId]);
 
   const currentSession = sessions.find(s => s.id === currentSessionId) || sessions[0];
 
@@ -128,6 +131,36 @@ const App: React.FC = () => {
       }
     } catch { /* silent */ }
   };
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Sandbox Deactivation — destroy sandbox on navigate away, keep in history
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const deactivateCurrentClone = useCallback((idToDeactivate?: string) => {
+    const targetId = idToDeactivate || cloneIdRef.current;
+    if (!targetId) return;
+
+    // Fire-and-forget: don't await, don't block navigation
+    fetch(`${API_URL}/clone/${targetId}/deactivate`, { method: 'POST' })
+      .catch(() => { /* silent */ });
+
+    // Optimistically update local history
+    setHistory(prev => prev.map(h =>
+      h.id === targetId ? { ...h, is_active: false } : h
+    ));
+  }, []);
+
+  // Deactivate sandbox on tab close / refresh
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      const id = cloneIdRef.current;
+      if (id) {
+        navigator.sendBeacon(`${API_URL}/clone/${id}/deactivate`);
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, []);
 
   // ═══════════════════════════════════════════════════════════════════════
   // Helpers
