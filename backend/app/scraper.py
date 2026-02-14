@@ -29,8 +29,12 @@ except ImportError:
 # If exceeded, skip expensive optional steps and rely on screenshots.
 EXTRACTION_TIME_BUDGET = 90
 
+# Hard cap on total scrape time (including navigation).
+# If exceeded, stop early and proceed with whatever data was collected.
+SCRAPE_TIME_LIMIT = 60
 
-async def scrape_website(url: str) -> dict:
+
+async def scrape_website(url: str, on_progress=None) -> dict:
     """
     Load a URL in Playwright, intercept ALL network requests,
     and extract a complete asset manifest + page data.
@@ -38,6 +42,16 @@ async def scrape_website(url: str) -> dict:
     Has a time budget — if extraction runs too long, expensive
     optional steps are skipped and we rely on screenshots.
     """
+
+    # Progress callback helper
+    async def _emit(msg: str):
+        if on_progress:
+            await on_progress(msg)
+
+    _scrape_start = _time.time()
+
+    def _total_time_left():
+        return SCRAPE_TIME_LIMIT - (_time.time() - _scrape_start)
 
     # Collect all network requests
     network_requests = []
@@ -89,10 +103,15 @@ async def scrape_website(url: str) -> dict:
         # Clean up page
         await prepare_page(page)
 
+        await _emit("Page loaded")
+
         # Start extraction time budget AFTER page load + prepare
         _extraction_start = _time.time()
         def _budget_left():
-            return EXTRACTION_TIME_BUDGET - (_time.time() - _extraction_start)
+            return min(
+                EXTRACTION_TIME_BUDGET - (_time.time() - _extraction_start),
+                _total_time_left(),
+            )
 
         # Brief wait for additional assets triggered by prepare_page
         await page.wait_for_timeout(500)
@@ -150,6 +169,8 @@ async def scrape_website(url: str) -> dict:
         except Exception as e:
             print(f"  [scrape] DOM images extraction failed: {e}")
             dom_images = []
+
+        await _emit(f"Analyzing assets ({len(assets['images'])} images, {len(assets['fonts'])} fonts)...")
 
         # Merge DOM images with network images (dedup by URL)
         image_urls = set(a["url"] for a in assets["images"])
@@ -322,6 +343,14 @@ async def scrape_website(url: str) -> dict:
         theme.setdefault("fonts", {})["google_font_urls"] = google_font_urls
         theme.setdefault("fonts", {})["custom_fonts"] = font_families
 
+        await _emit("Extracted theme & colors")
+
+        if _budget_left() < 3:
+            print(f"  [scrape] Time budget exhausted ({_budget_left():.1f}s) — skipping remaining extraction")
+            await browser.close()
+            return _partial_result(url, meta={"title": "", "description": "", "og_image": "", "favicon": ""},
+                                   assets=assets, theme=theme)
+
         # === EXTRACT CLICKABLES ===
         base_domain = urlparse(url).scheme + "://" + urlparse(url).netloc
 
@@ -400,6 +429,15 @@ async def scrape_website(url: str) -> dict:
             print(f"  [scrape] Clickables extraction failed: {e}")
             clickables = {"nav_links": [], "cta_buttons": [], "footer_links": [], "all_links": []}
 
+        await _emit("Extracted navigation & buttons")
+
+        if _budget_left() < 3:
+            print(f"  [scrape] Time budget exhausted ({_budget_left():.1f}s) — skipping SVGs, sections, screenshots")
+            meta = await _safe_extract_meta(page)
+            text_content = ""
+            await browser.close()
+            return _partial_result(url, meta=meta, assets=assets, theme=theme, clickables=clickables)
+
         # === EXTRACT SVGs ===
         try:
             svgs = await page.evaluate('''() => {
@@ -433,6 +471,8 @@ async def scrape_website(url: str) -> dict:
         except Exception as e:
             print(f"  [scrape] SVGs extraction failed: {e}")
             svgs = []
+
+        await _emit(f"Extracted {len(svgs)} SVGs")
 
         # === EXTRACT TEXT CONTENT ===
         try:
@@ -469,43 +509,47 @@ async def scrape_website(url: str) -> dict:
                 print(f"  [scrape] Sections extraction failed: {e}")
                 sections = []
 
+        await _emit(f"Extracted {len(sections)} sections")
+
         # === SCREENSHOTS (compressed to JPEG at capture time) ===
+        await _emit("Capturing screenshots...")
         page_height = await page.evaluate("document.body.scrollHeight")
 
-        # Viewport screenshot (first fold)
-        await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(200)
-        viewport_bytes = await page.screenshot()
-        viewport_b64, _ = screenshot_to_b64(viewport_bytes, compress=True)
-
-        # Full page thumbnail (resized + compressed)
-        # Cap page height to avoid OOM on very tall pages
-        max_full_page_height = 12000
-        if page_height > max_full_page_height:
-            await page.evaluate(f"document.body.style.maxHeight = '{max_full_page_height}px'")
-        full_bytes = await page.screenshot(full_page=True)
-        if page_height > max_full_page_height:
-            await page.evaluate("document.body.style.maxHeight = ''")
-        full_b64, _ = screenshot_to_b64(full_bytes, compress=True, max_width=1024, quality=60)
+        # Viewport screenshot (first fold) — wrapped in try/except for crash safety
+        viewport_b64 = None
+        try:
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(200)
+            viewport_bytes = await page.screenshot()
+            viewport_b64, _ = screenshot_to_b64(viewport_bytes, compress=True)
+        except Exception as e:
+            print(f"  [scrape] Viewport screenshot failed (browser crash?): {e}")
 
         # Viewport-scroll screenshots for chunked generation (capped at 4)
+        # Wrapped in try/except — browser can crash (SEGV) on heavy pages
         scroll_screenshots = []
         scroll_step = 900  # 1080 - 180 overlap
         max_scroll_screenshots = 4
         y = 0
-        while y < page_height and len(scroll_screenshots) < max_scroll_screenshots:
-            if _budget_left() < 2:
-                print(f"  [scrape] Time budget low — stopping scroll screenshots at {len(scroll_screenshots)}")
-                break
-            await page.evaluate(f"window.scrollTo(0, {y})")
-            await page.wait_for_timeout(200)
-            chunk_bytes = await page.screenshot()
-            chunk_b64, _ = screenshot_to_b64(chunk_bytes, compress=True)
-            scroll_screenshots.append({
-                "y": y,
-                "b64": chunk_b64,
-            })
-            y += scroll_step
+        try:
+            while y < page_height and len(scroll_screenshots) < max_scroll_screenshots:
+                if _budget_left() < 2:
+                    print(f"  [scrape] Time budget low — stopping scroll screenshots at {len(scroll_screenshots)}")
+                    break
+                await page.evaluate(f"window.scrollTo(0, {y})")
+                await page.wait_for_timeout(200)
+                chunk_bytes = await page.screenshot()
+                chunk_b64, _ = screenshot_to_b64(chunk_bytes, compress=True)
+                scroll_screenshots.append({
+                    "y": y,
+                    "b64": chunk_b64,
+                })
+                y += scroll_step
+        except Exception as e:
+            print(f"  [scrape] Scroll screenshots failed (browser crash?): {e}")
+
+        screenshot_count = (1 if viewport_b64 else 0) + len(scroll_screenshots)
+        await _emit(f"Captured {screenshot_count} screenshots")
 
         _total_extraction = _time.time() - _extraction_start
         print(f"  [scrape] Extraction finished in {_total_extraction:.1f}s "
@@ -525,11 +569,50 @@ async def scrape_website(url: str) -> dict:
         "page_height": page_height,
         "screenshots": {
             "viewport": viewport_b64,
-            "full_page": full_b64,
+            "full_page": None,
             "scroll_chunks": scroll_screenshots,
         },
         "meta": meta,
     }
+
+
+def _partial_result(url, meta=None, assets=None, theme=None, clickables=None,
+                    text_content="", svgs=None, sections=None, page_height=0,
+                    viewport_b64=None, scroll_screenshots=None):
+    """Build a partial scrape result when time limit is exceeded."""
+    return {
+        "url": url,
+        "title": (meta or {}).get("title", ""),
+        "assets": assets or {"images": [], "fonts": [], "stylesheets": [], "scripts": []},
+        "theme": theme or {"colors": {}, "fonts": {}},
+        "clickables": clickables or {"nav_links": [], "cta_buttons": [], "footer_links": [], "all_links": []},
+        "text_content": text_content,
+        "svgs": svgs or [],
+        "sections": sections or [],
+        "page_height": page_height,
+        "screenshots": {
+            "viewport": viewport_b64,
+            "full_page": None,
+            "scroll_chunks": scroll_screenshots or [],
+        },
+        "meta": meta or {"title": "", "description": "", "og_image": "", "favicon": ""},
+    }
+
+
+async def _safe_extract_meta(page):
+    """Extract meta tags, returning defaults on failure."""
+    try:
+        return await page.evaluate('''() => {
+            return {
+                title: document.title,
+                description: document.querySelector('meta[name="description"]')?.content || '',
+                og_image: document.querySelector('meta[property="og:image"]')?.content || '',
+                favicon: document.querySelector('link[rel="icon"]')?.href ||
+                         document.querySelector('link[rel="shortcut icon"]')?.href || ''
+            };
+        }''')
+    except Exception:
+        return {"title": "", "description": "", "og_image": "", "favicon": ""}
 
 
 async def extract_sections(page, max_sections: int = 15) -> list:

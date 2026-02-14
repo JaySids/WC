@@ -638,7 +638,7 @@ def _extract_json_from_response(raw: str) -> dict:
     return {}
 
 
-async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
+async def _generate_all(scrape_data: dict, on_progress=None) -> tuple[dict, int, int]:
     """
     Single Claude call to generate all project files from scrape data.
     Returns (files_dict, tokens_in, tokens_out).
@@ -650,17 +650,9 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
     # All screenshots are compressed to JPEG by image_utils.screenshot_to_b64
     screenshots = scrape_data.get("screenshots", {})
 
-    # Full page screenshot
-    full_ss = screenshots.get("full_page")
-    if full_ss:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": full_ss},
-        })
-
-    # Viewport screenshot
+    # Viewport screenshot (first fold)
     viewport_ss = screenshots.get("viewport")
-    if viewport_ss and not full_ss:
+    if viewport_ss:
         content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": "image/jpeg", "data": viewport_ss},
@@ -768,6 +760,7 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
     for attempt in range(max_retries):
         try:
             raw = ""
+            _last_progress_len = 0
             async with client.messages.stream(
                 model=CLAUDE_MODEL,
                 max_tokens=64000,
@@ -780,6 +773,9 @@ async def _generate_all(scrape_data: dict) -> tuple[dict, int, int]:
             ) as stream:
                 async for chunk in stream.text_stream:
                     raw += chunk
+                    if on_progress and len(raw) - _last_progress_len >= 5000:
+                        _last_progress_len = len(raw)
+                        await on_progress(f"Generating code... ({len(raw) // 1000}k chars)")
                 response = await stream.get_final_message()
 
             usage = getattr(response, "usage", None)
@@ -987,7 +983,15 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     # ============================================================
     yield sse_event("step", {"step": "scraping", "message": f"Scraping {url}..."})
 
-    scrape_task = asyncio.create_task(scrape_website(url))
+    # Use a queue to bridge progress events from the scrape task to this generator
+    scrape_progress_queue = asyncio.Queue()
+
+    async def _scrape_with_progress():
+        async def on_progress(msg):
+            await scrape_progress_queue.put(msg)
+        return await scrape_website(url, on_progress=on_progress)
+
+    scrape_task = asyncio.create_task(_scrape_with_progress())
     sandbox_task = asyncio.create_task(create_react_boilerplate_sandbox())
 
     pending = {scrape_task, sandbox_task}
@@ -995,7 +999,13 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     sandbox_info = None
 
     while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+
+        # Drain scrape progress events
+        while not scrape_progress_queue.empty():
+            msg = scrape_progress_queue.get_nowait()
+            yield sse_event("step", {"step": "scraping", "message": msg})
+
         for task in done:
             if task is sandbox_task:
                 try:
@@ -1036,6 +1046,11 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
                     yield sse_event("done", {"preview_url": state.get("preview_url"), "error": str(e)})
                     return
 
+    # Drain any remaining scrape progress messages
+    while not scrape_progress_queue.empty():
+        msg = scrape_progress_queue.get_nowait()
+        yield sse_event("step", {"step": "scraping", "message": msg})
+
     sections_raw = scrape_data.get("sections", [])
     images_raw = scrape_data.get("assets", {}).get("images", [])
     fonts_raw = scrape_data.get("assets", {}).get("fonts", [])
@@ -1073,9 +1088,8 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
     # Screenshot count
     scroll_count = len(screenshots_data.get("scroll_chunks", []))
-    has_full = bool(screenshots_data.get("full_page"))
     has_viewport = bool(screenshots_data.get("viewport"))
-    total_screenshots = scroll_count + (1 if has_full else 0) + (1 if has_viewport else 0)
+    total_screenshots = scroll_count + (1 if has_viewport else 0)
 
     yield sse_event("scrape_done", {
         "title": scrape_data.get("title", ""),
@@ -1133,8 +1147,28 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     yield sse_event("step", {"step": "generating", "message": "Generating React clone..."})
 
     gen_start = time.time()
+
+    # Use a queue to forward generation progress events as SSE
+    gen_progress_queue = asyncio.Queue()
+
+    async def on_gen_progress(msg):
+        await gen_progress_queue.put(msg)
+
+    gen_task = asyncio.create_task(_generate_all(scrape_data, on_progress=on_gen_progress))
+
     try:
-        files, tokens_in, tokens_out = await _generate_all(scrape_data)
+        while not gen_task.done():
+            await asyncio.sleep(0.3)
+            while not gen_progress_queue.empty():
+                msg = gen_progress_queue.get_nowait()
+                yield sse_event("step", {"step": "generating", "message": msg})
+
+        # Drain any remaining progress messages
+        while not gen_progress_queue.empty():
+            msg = gen_progress_queue.get_nowait()
+            yield sse_event("step", {"step": "generating", "message": msg})
+
+        files, tokens_in, tokens_out = gen_task.result()
         tokens_total_in += tokens_in
         tokens_total_out += tokens_out
     except Exception as e:
