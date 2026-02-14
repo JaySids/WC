@@ -10,6 +10,7 @@ import asyncio
 import base64
 import io
 import json
+import time as _time
 from urllib.parse import urlparse, urljoin
 
 from PIL import Image
@@ -24,10 +25,18 @@ except ImportError:
     _stealth = None
 
 
+# Time budget for extraction after page load (seconds).
+# If exceeded, skip expensive optional steps and rely on screenshots.
+EXTRACTION_TIME_BUDGET = 90
+
+
 async def scrape_website(url: str) -> dict:
     """
     Load a URL in Playwright, intercept ALL network requests,
     and extract a complete asset manifest + page data.
+
+    Has a time budget — if extraction runs too long, expensive
+    optional steps are skipped and we rely on screenshots.
     """
 
     # Collect all network requests
@@ -80,8 +89,13 @@ async def scrape_website(url: str) -> dict:
         # Clean up page
         await prepare_page(page)
 
+        # Start extraction time budget AFTER page load + prepare
+        _extraction_start = _time.time()
+        def _budget_left():
+            return EXTRACTION_TIME_BUDGET - (_time.time() - _extraction_start)
+
         # Brief wait for additional assets triggered by prepare_page
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(500)
 
         # === CATEGORIZE NETWORK REQUESTS ===
         assets = {
@@ -183,6 +197,7 @@ async def scrape_website(url: str) -> dict:
                     break
 
         # === EXTRACT THEME (computed styles) ===
+        # Theme is essential — always extract (fast: single page.evaluate)
         try:
             theme = await page.evaluate('''() => {
             const result = { colors: {}, fonts: {} };
@@ -444,18 +459,22 @@ async def scrape_website(url: str) -> dict:
             meta = {"title": "", "description": "", "og_image": "", "favicon": ""}
 
         # === EXTRACT SECTIONS (structured DOM) ===
-        try:
-            sections = await extract_sections(page)
-        except Exception as e:
-            print(f"  [scrape] Sections extraction failed: {e}")
+        if _budget_left() < 5:
+            print(f"  [scrape] Time budget low ({_budget_left():.1f}s) — skipping full section extraction, using screenshots only")
             sections = []
+        else:
+            try:
+                sections = await extract_sections(page, max_sections=15)
+            except Exception as e:
+                print(f"  [scrape] Sections extraction failed: {e}")
+                sections = []
 
         # === SCREENSHOTS (compressed to JPEG at capture time) ===
         page_height = await page.evaluate("document.body.scrollHeight")
 
         # Viewport screenshot (first fold)
         await page.evaluate("window.scrollTo(0, 0)")
-        await page.wait_for_timeout(300)
+        await page.wait_for_timeout(200)
         viewport_bytes = await page.screenshot()
         viewport_b64, _ = screenshot_to_b64(viewport_bytes, compress=True)
 
@@ -469,14 +488,17 @@ async def scrape_website(url: str) -> dict:
             await page.evaluate("document.body.style.maxHeight = ''")
         full_b64, _ = screenshot_to_b64(full_bytes, compress=True, max_width=1024, quality=60)
 
-        # Viewport-scroll screenshots for chunked generation (capped at 6)
+        # Viewport-scroll screenshots for chunked generation (capped at 4)
         scroll_screenshots = []
-        scroll_step = 880  # 1080 - 200 overlap
-        max_scroll_screenshots = 6
+        scroll_step = 900  # 1080 - 180 overlap
+        max_scroll_screenshots = 4
         y = 0
         while y < page_height and len(scroll_screenshots) < max_scroll_screenshots:
+            if _budget_left() < 2:
+                print(f"  [scrape] Time budget low — stopping scroll screenshots at {len(scroll_screenshots)}")
+                break
             await page.evaluate(f"window.scrollTo(0, {y})")
-            await page.wait_for_timeout(300)
+            await page.wait_for_timeout(200)
             chunk_bytes = await page.screenshot()
             chunk_b64, _ = screenshot_to_b64(chunk_bytes, compress=True)
             scroll_screenshots.append({
@@ -484,6 +506,10 @@ async def scrape_website(url: str) -> dict:
                 "b64": chunk_b64,
             })
             y += scroll_step
+
+        _total_extraction = _time.time() - _extraction_start
+        print(f"  [scrape] Extraction finished in {_total_extraction:.1f}s "
+              f"({len(sections)} sections, {len(scroll_screenshots)} scroll screenshots)")
 
         await browser.close()
 
@@ -506,14 +532,14 @@ async def scrape_website(url: str) -> dict:
     }
 
 
-async def extract_sections(page) -> list:
+async def extract_sections(page, max_sections: int = 15) -> list:
     """
     Extract structured, section-by-section DOM data.
     Identifies top-level sections, splits oversized blobs into sub-sections,
     extracts per-section content with layout properties, effective background
     colors (walking up DOM tree), image role detection, and improved SVG capture.
     """
-    return await page.evaluate('''() => {
+    return await page.evaluate('''(maxSections) => {
         // === UTILITIES ===
         function rgbToHex(rgb) {
             if (!rgb || rgb === 'transparent' || rgb === 'rgba(0, 0, 0, 0)') return null;
@@ -721,7 +747,7 @@ async def extract_sections(page) -> list:
 
         // Re-sort and cap
         expanded.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-        const sections = expanded.slice(0, 25);
+        const sections = expanded.slice(0, maxSections);
 
         // === EXTRACT PER-SECTION DATA ===
         return sections.map((el, idx) => {
@@ -900,7 +926,7 @@ async def extract_sections(page) -> list:
             }
 
             function walkDOM(node, depth, groupIndex, containerType) {
-                if (elements.length >= 30) return;
+                if (elements.length >= 20) return;
                 if (!node || !node.offsetWidth) return;
                 if (depth > 6) return;
 
@@ -1083,7 +1109,7 @@ async def extract_sections(page) -> list:
                 svgs,
             };
         });
-    }''')
+    }''', max_sections)
 
 
 async def extract_animations(page) -> dict:
@@ -2075,7 +2101,7 @@ async def prepare_page(page):
             }
         }
     }''')
-    await page.wait_for_timeout(500)
+    await page.wait_for_timeout(300)
 
     # Remove overlays
     await page.evaluate('''() => {
@@ -2122,10 +2148,10 @@ async def prepare_page(page):
     await page.evaluate('''async () => {
         await new Promise(resolve => {
             let total = 0;
-            const distance = 400;
-            const maxScroll = 15000;
+            const distance = 600;
+            const maxScroll = 8000;
             let iterations = 0;
-            const maxIterations = 50;
+            const maxIterations = 25;
             const timer = setInterval(() => {
                 window.scrollBy(0, distance);
                 total += distance;
@@ -2135,10 +2161,10 @@ async def prepare_page(page):
                     window.scrollTo(0, 0);
                     resolve();
                 }
-            }, 100);
+            }, 80);
         });
     }''')
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(1000)
 
     # Force images
     await page.evaluate('''() => {
@@ -2148,7 +2174,7 @@ async def prepare_page(page):
             if (img.dataset.srcset) img.srcset = img.dataset.srcset;
         });
     }''')
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(500)
 
 
 async def extract_dom_skeleton(page) -> str:

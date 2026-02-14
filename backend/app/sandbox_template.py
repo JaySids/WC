@@ -299,11 +299,18 @@ async def upload_files_to_sandbox(sandbox_id: str, files: dict, project_root: st
             try:
                 daytona = get_daytona_client()
                 sb = daytona.get(sandbox_id)
-                for fp, content in files.items():
+
+                # Batch: create all needed directories in one command
+                dirs = set()
+                for fp in files:
                     full_path = f"{project_root}/{fp}"
-                    dir_path = "/".join(full_path.split("/")[:-1])
-                    sb.process.exec(f"mkdir -p {dir_path}", timeout=15)
-                    sb.fs.upload_file(content.encode("utf-8"), full_path)
+                    dirs.add("/".join(full_path.split("/")[:-1]))
+                if dirs:
+                    sb.process.exec(f"mkdir -p {' '.join(dirs)}", timeout=15)
+
+                # Upload all files (no per-file mkdir)
+                for fp, content in files.items():
+                    sb.fs.upload_file(content.encode("utf-8"), f"{project_root}/{fp}")
                 return  # success
             except Exception as e:
                 last_err = e

@@ -1096,9 +1096,10 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         "svgs": len(scrape_data.get("svgs", [])),
     })
 
-    # Quality gate: no sections at all
-    if not sections_raw:
-        _log("No sections detected — aborting")
+    # Quality gate: no sections at all (but allow if we have screenshots — sections may have been skipped due to time budget)
+    has_screenshots = bool(screenshots_data.get("viewport") or screenshots_data.get("scroll_chunks"))
+    if not sections_raw and not has_screenshots:
+        _log("No sections detected and no screenshots — aborting")
         yield sse_event("error", {
             "message": "No content sections detected on the page. "
                        "The site may be behind a login, use heavy JavaScript rendering, "
@@ -1107,9 +1108,12 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
         yield sse_event("done", {"preview_url": None, "error": "No sections detected"})
         return
 
+    if not sections_raw and has_screenshots:
+        _log("No sections but have screenshots — proceeding with screenshot-only mode")
+
     # Quality gate: scrape too thin
     text_len = len(scrape_data.get("text_content", ""))
-    if len(sections_raw) <= 1 and len(images_raw) <= 3 and text_len < 500:
+    if len(sections_raw) <= 1 and len(images_raw) <= 3 and text_len < 500 and not has_screenshots:
         _log(f"Scrape too thin — {len(sections_raw)} sections, {len(images_raw)} images, "
              f"{text_len} chars — aborting")
         yield sse_event("error", {
@@ -1219,15 +1223,28 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
     fix_iterations = 0
     max_fix_attempts = 4
 
-    _log("Waiting 10s for initial compilation...")
     yield sse_event("step", {"step": "checking", "message": "Waiting for compilation..."})
-    await asyncio.sleep(10)
+
+    # Progressive poll instead of hard 10s sleep — check every 2s, bail early if ready
+    _log("Polling for compilation...")
+    for _poll in range(8):  # up to 16s
+        await asyncio.sleep(2)
+        quick = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0)
+        if quick["ok"]:
+            _log(f"Page ready after {(_poll + 1) * 2}s")
+            yield sse_event("compiled", {"message": "Compiled and verified successfully"})
+            break
+    else:
+        quick = {"ok": False}  # fell through — enter fix loop
 
     for attempt in range(max_fix_attempts):
+        if attempt == 0 and quick.get("ok"):
+            break  # already verified above
+
         _log(f"Checking compilation (attempt {attempt + 1}/{max_fix_attempts})...")
 
         # 1. Fast-path: HTTP check
-        http_result = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0)
+        http_result = await _check_sandbox_http(sandbox_info["sandbox_id"], wait_before=0) if attempt > 0 else quick
         _save_file_locally(state.get("clone_id"),
                            f"_diagnostics/http_check_attempt{attempt+1}.txt",
                            f"status={http_result['status_code']} ok={http_result['ok']}\n{http_result.get('body', '')[:2000]}")
@@ -1252,6 +1269,44 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
 
         _save_file_locally(state.get("clone_id"),
                            f"_diagnostics/server_logs_attempt{attempt+1}.txt", logs)
+
+        # 2b. Fast-path: "Module not found" → install the package directly
+        #     instead of wasting an AI fix iteration on a missing npm package.
+        missing_modules = re.findall(
+            r"Module not found: Can't resolve ['\"]([^'\"]+)['\"]", logs
+        )
+        # Also check the HTTP body for the same pattern
+        missing_modules += re.findall(
+            r"Module not found: Can't resolve ['\"]([^'\"]+)['\"]",
+            http_result.get("body", ""),
+        )
+        # Dedupe
+        missing_modules = list(dict.fromkeys(missing_modules))
+
+        if missing_modules:
+            # Filter to actual npm packages (not relative imports like "./foo")
+            npm_packages = [m for m in missing_modules if not m.startswith(".") and not m.startswith("/")]
+            if npm_packages:
+                _log(f"Missing npm packages detected: {npm_packages} — installing directly")
+                yield sse_event("step", {"step": "fixing", "message": f"Installing missing packages: {', '.join(npm_packages)}..."})
+
+                def _install_missing():
+                    try:
+                        daytona = get_daytona_client()
+                        sb = daytona.get(sandbox_info["sandbox_id"])
+                        sb.process.exec(
+                            f"{BUN_BIN} add --cwd {state['project_root']} {' '.join(npm_packages)}",
+                            timeout=60,
+                        )
+                    except Exception as e:
+                        print(f"  [install-missing] Failed: {e}")
+                await asyncio.to_thread(_install_missing)
+
+                # Restart dev server after installing packages
+                await _restart_dev_server(sandbox_info["sandbox_id"], state["project_root"])
+                _log("Restarting after package install...")
+                await asyncio.sleep(3)
+                continue  # re-check HTTP without counting as a fix attempt
 
         # Last attempt — no more fixes, just warn
         if attempt >= max_fix_attempts - 1:
@@ -1312,8 +1367,8 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
             )
 
             yield sse_event("step", {"step": "verifying", "message": f"Verifying fix (attempt {fix_iterations})..."})
-            _log("Waiting 10s for recompilation after fix...")
-            await asyncio.sleep(10)
+            _log("Waiting for recompilation after fix...")
+            await asyncio.sleep(5)
             continue
 
         # AI failed or returned unexpected status

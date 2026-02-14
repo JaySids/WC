@@ -255,28 +255,52 @@ async def create_react_boilerplate_sandbox(progress: queue.Queue | None = None) 
                 # the project but doesn't reliably finish installing deps.
                 _notify("Installing dependencies...")
                 _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
-                time.sleep(10)
+                time.sleep(3)
 
-                # Install extra packages
-                _notify("Installing extra packages...")
-                _exec(
-                    sandbox,
-                    f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(EXTRA_PACKAGES)}",
-                    timeout=180,
-                )
+                # Install extra packages in batches — one massive bun add
+                # with 33 packages is unreliable and can timeout/partial-fail.
+                batch_size = 10
+                for i in range(0, len(EXTRA_PACKAGES), batch_size):
+                    batch = EXTRA_PACKAGES[i:i + batch_size]
+                    batch_num = (i // batch_size) + 1
+                    total_batches = (len(EXTRA_PACKAGES) + batch_size - 1) // batch_size
+                    _notify(f"Installing packages ({batch_num}/{total_batches})...")
+                    _exec(
+                        sandbox,
+                        f"{BUN_BIN} add --cwd {PROJECT_PATH} {' '.join(batch)}",
+                        timeout=120,
+                    )
 
                 # Final bun install to make sure everything is linked properly
                 _notify("Verifying all dependencies...")
                 _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
-                time.sleep(10)
+                time.sleep(2)
 
-                # Verify next binary exists — if not, something went wrong
-                check = sandbox.process.exec(
-                    f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
-                    timeout=10,
-                )
-                if "MISSING" in (check.result or ""):
-                    raise RuntimeError("next binary missing after all install steps")
+                # Verify key packages — retry install up to 3 times if next binary is missing
+                for _verify_attempt in range(3):
+                    check = sandbox.process.exec(
+                        f"test -f {PROJECT_PATH}/node_modules/.bin/next && echo OK || echo MISSING",
+                        timeout=10,
+                    )
+                    if "OK" in (check.result or ""):
+                        break
+                    _notify(f"next binary missing (attempt {_verify_attempt + 1}/3) — nuking node_modules and reinstalling...")
+                    _exec(sandbox, f"rm -rf {PROJECT_PATH}/node_modules {PROJECT_PATH}/bun.lock", timeout=30)
+                    _exec(sandbox, f"{BUN_BIN} install --cwd {PROJECT_PATH}", timeout=120)
+                    time.sleep(3)
+                else:
+                    raise RuntimeError("next binary still missing after 3 reinstall attempts")
+
+                # Spot-check a few extra packages — reinstall individually if missing
+                spot_check = ["lucide-react", "framer-motion", "clsx"]
+                for pkg in spot_check:
+                    pkg_check = sandbox.process.exec(
+                        f"test -d {PROJECT_PATH}/node_modules/{pkg} && echo OK || echo MISSING",
+                        timeout=10,
+                    )
+                    if "MISSING" in (pkg_check.result or ""):
+                        _notify(f"Package {pkg} missing — reinstalling...")
+                        _exec(sandbox, f"{BUN_BIN} add --cwd {PROJECT_PATH} {pkg}", timeout=60)
 
                 # Upload ErrorBoundary component
                 sandbox.process.exec(f"mkdir -p {PROJECT_PATH}/components", timeout=5)
