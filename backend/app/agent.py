@@ -1269,7 +1269,11 @@ async def run_clone_streaming(url: str) -> AsyncGenerator[str, None]:
             yield sse_event("compiled", {"message": "Compiled and verified successfully"})
             break
     else:
-        quick = {"ok": False}  # fell through — enter fix loop
+        # Poll loop exhausted — quick already holds the last poll result (with all keys).
+        # Guard against edge cases where it might be missing expected keys.
+        if "status_code" not in quick:
+            quick = {"ok": False, "status_code": 0, "errors": ["poll_timeout"],
+                     "error_messages": [], "body_length": 0, "body": ""}
 
     for attempt in range(max_fix_attempts):
         if attempt == 0 and quick.get("ok"):
