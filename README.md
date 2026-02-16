@@ -4,8 +4,6 @@ AI-powered website replication tool. Paste a URL, get a pixel-perfect React clon
 
 **[Live App](https://wc-three.vercel.app/)** | **[Demo Video](https://www.loom.com/share/44fa43542f084ca9a69d8f87b487fe83)**
 
-Built for an [Afterquery](https://afterquery.com) (YC) internship assessment.
-
 ---
 
 ## How It Works
